@@ -82,8 +82,8 @@ fn unpack_options(
     bigfile: &Bigfile,
 ) -> UnpackOptions {
     UnpackOptions {
-        sku_mask: args.sku.mask,
-        single_match_per_hash: args.resolution.engine_sku_match,
+        spec_mask: args.spec.mask,
+        single_match_per_hash: args.resolution.engine_spec_match,
         variant_layout: args.variant_layout.into(),
         raw: args.payload.raw,
         filter,

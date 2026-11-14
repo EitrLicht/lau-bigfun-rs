@@ -72,7 +72,8 @@ pub enum FatError {
 /// On-disk layout in `bigfile.000` (`@0x04 + 4*count + 16*index`, in archive endianness):
 /// - `+0x00`: `u32 size` (uncompressed byte size)
 /// - `+0x04`: `u32 sector_number` (logical start sector; byte offset = `sector_number * 2048`)
-/// - `+0x08`: `u32 sku_flags` (SKU / language / platform bitmask)
+/// - `+0x08`: `u32 spec_flags` (the engine's specialisation bitmask; what each bit selects is
+///   game-specific)
 /// - `+0x0C`: `i32 deflated_size` (compressed size; `0` => stored uncompressed)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
@@ -84,8 +85,8 @@ pub struct Entry {
     pub size: u32,
     /// Starting sector index in the logical archive address space.
     pub sector_number: u32,
-    /// SKU, language, and platform bitmask.
-    pub sku_flags: u32,
+    /// The engine's specialisation bitmask. What each bit selects is game-specific.
+    pub spec_flags: u32,
     /// Compressed size in bytes (`0` means stored uncompressed).
     pub deflated_size: i32,
 }
@@ -135,12 +136,12 @@ impl Entry {
         }
     }
 
-    /// Tests whether this entry satisfies `sku_mask` using the engine's bitwise rule
-    /// `(entry.sku_flags & sku_mask) == sku_mask`.
+    /// Tests whether this entry satisfies `spec_mask` using the engine's bitwise rule
+    /// `(entry.spec_flags & spec_mask) == spec_mask`.
     #[inline]
     #[must_use]
-    pub const fn matches_sku_mask(&self, sku_mask: u32) -> bool {
-        (self.sku_flags & sku_mask) == sku_mask
+    pub const fn matches_spec_mask(&self, spec_mask: u32) -> bool {
+        (self.spec_flags & spec_mask) == spec_mask
     }
 }
 
@@ -355,13 +356,13 @@ impl Fat {
         record: [[u8; 4]; 4],
         endian: Endian,
     ) -> Entry {
-        let [size, sector_number, sku_flags, deflated_size] = record;
+        let [size, sector_number, spec_flags, deflated_size] = record;
         Entry {
             index,
             name_hash: endian.read_u32(hash),
             size: endian.read_u32(size),
             sector_number: endian.read_u32(sector_number),
-            sku_flags: endian.read_u32(sku_flags),
+            spec_flags: endian.read_u32(spec_flags),
             deflated_size: endian.read_i32(deflated_size),
         }
     }
@@ -458,8 +459,8 @@ impl Fat {
 
     /// Returns all entries matching `target_hash` in TOC order ($O(\log N)$ binary search).
     ///
-    /// Because `hashes` are sorted non-decreasing, all locale/SKU variants for a given path hash
-    /// occupy a contiguous slice.
+    /// Because `hashes` are sorted non-decreasing, all specialisation variants for a given path
+    /// hash occupy a contiguous slice.
     #[must_use]
     pub fn find_all(&self, target_hash: u32) -> &[Entry] {
         let start = self.entries.partition_point(|e| e.name_hash < target_hash);
@@ -467,31 +468,31 @@ impl Fat {
         &self.entries[start..end]
     }
 
-    /// Returns an iterator over `entries` whose `sku_flags` satisfy `sku_mask`
-    /// (or all `entries` when `sku_mask` is `None`).
+    /// Returns an iterator over `entries` whose `spec_flags` satisfy `spec_mask`
+    /// (or all `entries` when `spec_mask` is `None`).
     #[inline]
-    pub fn filter_sku_mask(
+    pub fn filter_spec_mask(
         entries: &[Entry],
-        sku_mask: Option<u32>,
+        spec_mask: Option<u32>,
     ) -> impl Iterator<Item = &Entry> {
         entries
             .iter()
-            .filter(move |e| sku_mask.is_none_or(|mask| e.matches_sku_mask(mask)))
+            .filter(move |e| spec_mask.is_none_or(|mask| e.matches_spec_mask(mask)))
     }
 
-    /// Returns an iterator over all entries matching `target_hash` whose `sku_flags` satisfy `sku_mask`
-    /// (`(entry.sku_flags & sku_mask) == sku_mask`).
+    /// Returns an iterator over all entries matching `target_hash` whose `spec_flags` satisfy `spec_mask`
+    /// (`(entry.spec_flags & spec_mask) == spec_mask`).
     #[inline]
-    pub fn find_all_with_sku_mask(
+    pub fn find_all_with_spec_mask(
         &self,
         target_hash: u32,
-        sku_mask: u32,
+        spec_mask: u32,
     ) -> impl Iterator<Item = &Entry> {
-        Self::filter_sku_mask(self.find_all(target_hash), Some(sku_mask))
+        Self::filter_spec_mask(self.find_all(target_hash), Some(spec_mask))
     }
 
-    /// Finds the entry selected by the game engine's lookup order for `target_hash` and `sku_mask`,
-    /// where `sku_flags` must satisfy `(entry.sku_flags & sku_mask) == sku_mask`.
+    /// Finds the entry selected by the game engine's lookup order for `target_hash` and
+    /// `spec_mask`, where `spec_flags` must satisfy `(entry.spec_flags & spec_mask) == spec_mask`.
     ///
     /// That order tries the record a binary search lands on, then walks down through the rest of
     /// the hash's run, then up. The landing record depends only on `target_hash` and the table, so
@@ -501,7 +502,7 @@ impl Fat {
     /// base, the record it loads can come from another archive; [`ArchiveSet`](crate::ArchiveSet)
     /// resolves a name across them.
     #[must_use]
-    pub fn find_with_sku_mask(&self, target_hash: u32, sku_mask: u32) -> Option<&Entry> {
+    pub fn find_with_spec_mask(&self, target_hash: u32, spec_mask: u32) -> Option<&Entry> {
         let landing = self.engine_landing_index(target_hash)?;
         let (below, from_landing) = self.entries.split_at(landing);
         let (landing_entry, above) = from_landing.split_first()?;
@@ -509,7 +510,7 @@ impl Fat {
         std::iter::once(landing_entry)
             .chain(below.iter().rev().take_while(same_hash))
             .chain(above.iter().take_while(same_hash))
-            .find(|entry| entry.matches_sku_mask(sku_mask))
+            .find(|entry| entry.matches_spec_mask(spec_mask))
     }
 
     /// Returns the index the engine's binary search lands on for `target_hash`, tracking the
@@ -548,7 +549,7 @@ mod tests {
     use super::*;
     use crate::test_support::build_fat_bytes;
 
-    /// Parses a FAT from `(name_hash, sku_flags)` pairs, with each record's size set to its index.
+    /// Parses a FAT from `(name_hash, spec_flags)` pairs, with each record's size set to its index.
     fn fat_from_hash_flags(records: &[(u32, u32)]) -> Fat {
         let records: Vec<_> = records
             .iter()
@@ -559,13 +560,13 @@ mod tests {
     }
 
     fn found_index(fat: &Fat, hash: u32, mask: u32) -> Option<usize> {
-        fat.find_with_sku_mask(hash, mask).map(|entry| entry.index)
+        fat.find_with_spec_mask(hash, mask).map(|entry| entry.index)
     }
 
     const LOOKUP_HASH: u32 = 0x2000;
 
     #[test]
-    fn find_with_sku_mask_starts_at_landing_record() {
+    fn find_with_spec_mask_starts_at_landing_record() {
         let records =
             [10, LOOKUP_HASH, LOOKUP_HASH, LOOKUP_HASH, 0xFFFF_FFF0].map(|hash| (hash, 1));
         assert_eq!(
@@ -575,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn find_with_sku_mask_prefers_record_below_failing_landing() {
+    fn find_with_spec_mask_prefers_record_below_failing_landing() {
         let flags = [
             (10, 1),
             (LOOKUP_HASH, 1),
@@ -590,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn find_with_sku_mask_walks_up_after_exhausting_records_below() {
+    fn find_with_spec_mask_walks_up_after_exhausting_records_below() {
         let flags = [
             (10, 1),
             (LOOKUP_HASH, 0),
@@ -605,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn find_with_sku_mask_stops_at_run_boundaries() {
+    fn find_with_spec_mask_stops_at_run_boundaries() {
         let flags = [(0x1000, 1), (LOOKUP_HASH, 0), (LOOKUP_HASH, 0), (0x3000, 1)];
         assert_eq!(
             found_index(&fat_from_hash_flags(&flags), LOOKUP_HASH, 1),
@@ -614,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn find_with_sku_mask_rejects_absent_hash_in_empty_table() {
+    fn find_with_spec_mask_rejects_absent_hash_in_empty_table() {
         assert_eq!(found_index(&fat_from_hash_flags(&[]), LOOKUP_HASH, 0), None);
     }
 
@@ -716,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_sku_masked_variants() {
+    fn finds_spec_masked_variants() {
         let bytes = build_fat_bytes(
             Endian::Little,
             &[
@@ -727,16 +728,16 @@ mod tests {
         );
         let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
 
-        let sku1 = fat.find_with_sku_mask(0x2000, 0b0011).unwrap();
-        assert_eq!(sku1.size, 200);
-        let sku2 = fat.find_with_sku_mask(0x2000, 0b0100).unwrap();
-        assert_eq!(sku2.size, 200);
-        assert!(fat.find_with_sku_mask(0x2000, 0b1000).is_none());
+        let spec1 = fat.find_with_spec_mask(0x2000, 0b0011).unwrap();
+        assert_eq!(spec1.size, 200);
+        let spec2 = fat.find_with_spec_mask(0x2000, 0b0100).unwrap();
+        assert_eq!(spec2.size, 200);
+        assert!(fat.find_with_spec_mask(0x2000, 0b1000).is_none());
 
-        let all_sku1: Vec<&Entry> = fat.find_all_with_sku_mask(0x2000, 0b0011).collect();
-        assert_eq!(all_sku1.len(), 2);
-        assert_eq!(all_sku1[0].size, 100);
-        assert_eq!(all_sku1[1].size, 200);
+        let all_spec1: Vec<&Entry> = fat.find_all_with_spec_mask(0x2000, 0b0011).collect();
+        assert_eq!(all_spec1.len(), 2);
+        assert_eq!(all_spec1[0].size, 100);
+        assert_eq!(all_spec1[1].size, 200);
     }
 
     #[test]

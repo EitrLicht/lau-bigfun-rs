@@ -62,11 +62,11 @@ pub enum BigfileError {
     NoPartsFound(PathBuf),
 
     /// [`unpack_archive_set`](crate::unpack_archive_set) was given several archives without
-    /// [`UnpackOptions::sku_mask`](crate::UnpackOptions::sku_mask) and
+    /// [`UnpackOptions::spec_mask`](crate::UnpackOptions::spec_mask) and
     /// [`UnpackOptions::single_match_per_hash`](crate::UnpackOptions::single_match_per_hash),
     /// which resolving a name across archives needs.
-    #[error("resolving across archives requires a SKU mask and single-match selection")]
-    ResolutionRequiresSkuMatch,
+    #[error("resolving across archives requires a spec mask and single-match selection")]
+    ResolutionRequiresSpecMatch,
 
     /// Set [`OpenOptions::endian`] to choose between the two byte orders.
     #[error(
@@ -642,7 +642,7 @@ impl Bigfile {
         Ok(EntryReader::new(*entry, raw, stored))
     }
 
-    /// Returns all entries matching `name_hash` (all SKU/locale variants).
+    /// Returns all entries matching `name_hash` (all specialisation variants).
     #[inline]
     #[must_use]
     pub fn find(&self, name_hash: u32) -> &[Entry] {
@@ -650,11 +650,11 @@ impl Bigfile {
     }
 
     /// Finds the entry selected by the game engine's lookup order within this archive for
-    /// `name_hash` and `sku_mask` (see [`Fat::find_with_sku_mask`]).
+    /// `name_hash` and `spec_mask` (see [`Fat::find_with_spec_mask`]).
     #[inline]
     #[must_use]
-    pub fn find_with_sku_mask(&self, name_hash: u32, sku_mask: u32) -> Option<&Entry> {
-        self.fat.find_with_sku_mask(name_hash, sku_mask)
+    pub fn find_with_spec_mask(&self, name_hash: u32, spec_mask: u32) -> Option<&Entry> {
+        self.fat.find_with_spec_mask(name_hash, spec_mask)
     }
 }
 
@@ -981,7 +981,7 @@ mod tests {
             name_hash: 0xDEAD_BEEF,
             size: 0,
             sector_number: 10,
-            sku_flags: 1,
+            spec_flags: 1,
             deflated_size: 0,
         };
         assert!(matches!(

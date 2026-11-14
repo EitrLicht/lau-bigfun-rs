@@ -11,30 +11,30 @@ use crate::filter::EntryFilter;
 use crate::path::{append_stem_suffix, normalized_rel_key, parent_dir};
 
 #[inline]
-const fn needs_sku_disambiguation(layout: VariantLayout, total_selected_for_hash: usize) -> bool {
+const fn needs_spec_disambiguation(layout: VariantLayout, total_selected_for_hash: usize) -> bool {
     match layout {
-        VariantLayout::AlwaysSkuSubdir => true,
-        VariantLayout::SkuSubdirWhenAmbiguous | VariantLayout::FilenameSuffix => {
+        VariantLayout::AlwaysSpecSubdir => true,
+        VariantLayout::SpecSubdirWhenAmbiguous | VariantLayout::FilenameSuffix => {
             total_selected_for_hash > 1
         }
     }
 }
 
 /// Formats the relative output path for a variant by applying any filename stem suffix
-/// (`.sku_<hex>` and/or `.v{occ}`) and any `sku_<hex>/` directory prefix orthogonally.
+/// (`.spec_<hex>` and/or `.v{occ}`) and any `spec_<hex>/` directory prefix orthogonally.
 fn format_variant_rel_path(
     base_rel_path: &Path,
-    sku_flags: u32,
+    spec_flags: u32,
     layout: VariantLayout,
     disambiguate: bool,
-    same_sku_occurrence_index: usize,
+    same_spec_occurrence_index: usize,
 ) -> PathBuf {
     let mut suffix = String::new();
     if disambiguate && layout == VariantLayout::FilenameSuffix {
-        suffix.push_str(&format!(".sku_{sku_flags:08x}"));
+        suffix.push_str(&format!(".spec_{spec_flags:08x}"));
     }
-    if same_sku_occurrence_index > 0 {
-        suffix.push_str(&format!(".v{same_sku_occurrence_index}"));
+    if same_spec_occurrence_index > 0 {
+        suffix.push_str(&format!(".v{same_spec_occurrence_index}"));
     }
     let rel = if suffix.is_empty() {
         base_rel_path.to_path_buf()
@@ -44,10 +44,10 @@ fn format_variant_rel_path(
     if disambiguate
         && matches!(
             layout,
-            VariantLayout::AlwaysSkuSubdir | VariantLayout::SkuSubdirWhenAmbiguous
+            VariantLayout::AlwaysSpecSubdir | VariantLayout::SpecSubdirWhenAmbiguous
         )
     {
-        PathBuf::from(format!("sku_{sku_flags:08x}")).join(rel)
+        PathBuf::from(format!("spec_{spec_flags:08x}")).join(rel)
     } else {
         rel
     }
@@ -160,7 +160,7 @@ fn select_entries_from_run<'a>(
                     .map(|resolved| resolved.entry),
             );
         }
-        None => out.extend(Fat::filter_sku_mask(run, options.sku_mask)),
+        None => out.extend(Fat::filter_spec_mask(run, options.spec_mask)),
     }
 }
 
@@ -216,12 +216,12 @@ impl<'a> RelativePlan<'a> {
         candidate: &SelectedCandidate<'_>,
         layout: VariantLayout,
     ) -> (PathBuf, String) {
-        let disambiguate = needs_sku_disambiguation(layout, candidate.total_for_hash);
-        let sku_flags = candidate.entry.sku_flags;
+        let disambiguate = needs_spec_disambiguation(layout, candidate.total_for_hash);
+        let spec_flags = candidate.entry.spec_flags;
         let candidate_path = |occurrence| {
             format_variant_rel_path(
                 &candidate.base_rel,
-                sku_flags,
+                spec_flags,
                 layout,
                 disambiguate,
                 occurrence,
@@ -376,7 +376,7 @@ mod tests {
         build_extraction_plan(
             &selection,
             Path::new("/out"),
-            VariantLayout::SkuSubdirWhenAmbiguous,
+            VariantLayout::SpecSubdirWhenAmbiguous,
         )
         .items
         .into_iter()
@@ -481,8 +481,8 @@ mod tests {
     #[test]
     fn format_variant_rel_path_supports_all_variant_layouts() {
         use VariantLayout::{
-            AlwaysSkuSubdir as Always, FilenameSuffix as Suffix,
-            SkuSubdirWhenAmbiguous as Ambiguous,
+            AlwaysSpecSubdir as Always, FilenameSuffix as Suffix,
+            SpecSubdirWhenAmbiguous as Ambiguous,
         };
         let fmt = |rel: &str, layout, multi, occ| {
             format_variant_rel_path(Path::new(rel), 0x0000_0003, layout, multi, occ)
@@ -493,27 +493,27 @@ mod tests {
         );
         assert_eq!(
             fmt("pc-w/lara.drm", Ambiguous, true, 0),
-            Path::new("sku_00000003/pc-w/lara.drm")
+            Path::new("spec_00000003/pc-w/lara.drm")
         );
         assert_eq!(
             fmt("pc-w/lara.drm", Always, true, 0),
-            Path::new("sku_00000003/pc-w/lara.drm")
+            Path::new("spec_00000003/pc-w/lara.drm")
         );
         assert_eq!(
             fmt("pc-w/lara.drm", Suffix, true, 0),
-            Path::new("pc-w/lara.sku_00000003.drm")
+            Path::new("pc-w/lara.spec_00000003.drm")
         );
         assert_eq!(
             fmt("pc-w/lara.drm", Suffix, true, 1),
-            Path::new("pc-w/lara.sku_00000003.v1.drm")
+            Path::new("pc-w/lara.spec_00000003.v1.drm")
         );
         assert_eq!(
             fmt("README", Suffix, true, 1),
-            Path::new("README.sku_00000003.v1")
+            Path::new("README.spec_00000003.v1")
         );
         assert_eq!(
             fmt("pc-w/trailing.", Suffix, true, 1),
-            Path::new("pc-w/trailing.sku_00000003.v1")
+            Path::new("pc-w/trailing.spec_00000003.v1")
         );
     }
 }

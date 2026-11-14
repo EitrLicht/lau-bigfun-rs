@@ -99,7 +99,7 @@ fn cli_subcommands_dispatch_through_execute_cli() {
         a,
         "--filelist",
         f,
-        "--sku-mask",
+        "--spec-mask",
         "0x1",
         "--filter",
         "lara",
@@ -110,7 +110,7 @@ fn cli_subcommands_dispatch_through_execute_cli() {
     assert_eq!(list_err, "1 entries; segment_length=unsplit\n");
     assert!(String::from_utf8(list_out).unwrap().contains("0x5ff91900"));
 
-    let (filtered_out, _) = exec_args(&["-q", "list", a, "--sku-mask", "0x2"], false).unwrap();
+    let (filtered_out, _) = exec_args(&["-q", "list", a, "--spec-mask", "0x2"], false).unwrap();
     assert!(filtered_out.is_empty());
 
     let out_dir = dir.join("unpacked");
@@ -148,12 +148,12 @@ fn numeric_parsers_accept_decimal_or_hex_values() {
 #[test]
 fn parse_target_hash_distinguishes_hex_hashes_from_paths() {
     assert_eq!(
-        VariantLayout::from(CliVariantLayout::SkuDir),
-        VariantLayout::SkuSubdirWhenAmbiguous
+        VariantLayout::from(CliVariantLayout::SpecDir),
+        VariantLayout::SpecSubdirWhenAmbiguous
     );
     assert_eq!(
-        VariantLayout::from(CliVariantLayout::AlwaysSkuDir),
-        VariantLayout::AlwaysSkuSubdir
+        VariantLayout::from(CliVariantLayout::AlwaysSpecDir),
+        VariantLayout::AlwaysSpecSubdir
     );
     assert_eq!(
         VariantLayout::from(CliVariantLayout::Suffix),
@@ -176,22 +176,22 @@ fn parse_target_hash_distinguishes_hex_hashes_from_paths() {
 }
 
 #[test]
-fn cli_extract_engine_sku_match_conflicts_with_variant() {
-    let argv = ["extract", "a", "b", "--sku-mask", "1", "--variant", "0"];
+fn cli_extract_engine_spec_match_conflicts_with_variant() {
+    let argv = ["extract", "a", "b", "--spec-mask", "1", "--variant", "0"];
     assert!(parse_args(&argv).is_ok());
-    assert!(parse_args(&[argv.as_slice(), &["--engine-sku-match"]].concat()).is_err());
+    assert!(parse_args(&[argv.as_slice(), &["--engine-spec-match"]].concat()).is_err());
 }
 
 #[test]
-fn cli_engine_sku_match_requires_sku_mask() {
+fn cli_engine_spec_match_requires_spec_mask() {
     let argv = ["unpack", "archive", "-o", "out"];
-    let err = parse_args(&[argv.as_slice(), &["--engine-sku-match"]].concat()).unwrap_err();
+    let err = parse_args(&[argv.as_slice(), &["--engine-spec-match"]].concat()).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     assert!(
         parse_args(
             &[
                 argv.as_slice(),
-                &["--engine-sku-match", "--sku-mask", "0x1"]
+                &["--engine-spec-match", "--spec-mask", "0x1"]
             ]
             .concat()
         )

@@ -1,12 +1,14 @@
 [package]
 name = "lau-bigfun"
-version = "0.2.1"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Tomb Raider LAU (Legend, Anniversary, Underworld) bigfile archive reader and unpacker"
 license = "MIT"
 repository = "https://github.com/EitrLicht/lau-bigfun-rs"
-exclude = ["/fuzz"]
+keywords = ["tomb-raider", "bigfile", "archive", "unpacker", "modding"]
+categories = ["command-line-utilities", "game-development", "parser-implementations"]
+include = ["/src/**", "/tests/**", "/README.md", "/LICENSE", "/SECURITY.md"]
 
 [lib]
 name = "lau_bigfun"

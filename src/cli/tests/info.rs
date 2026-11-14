@@ -15,7 +15,7 @@ fn info_reports_dictionary_resolution_coverage() {
     assert!(named_out.contains("Total TOC entries:    1"));
     assert!(named_out.contains("Resolved names:       1 / 1 (100.0%)"));
     assert!(named_out.contains("Total stored bytes:   22\nTotal logical bytes:  22"));
-    assert!(named_out.contains("  sku=0x00000001 -> 1 entries"));
+    assert!(named_out.contains("  spec=0x00000001 -> 1 entries"));
 
     let empty_out = info_stdout(&["info", a]);
     assert!(empty_out.contains("Resolved names:       0 / 1 (0.0%)"));
@@ -40,7 +40,7 @@ fn info_json_emits_structured_archive_summary() {
     assert_eq!(
         val,
         serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "archive": dir_str,
             "stem": "bigfile",
             "endian": "little-endian",
@@ -53,7 +53,7 @@ fn info_json_emits_structured_archive_summary() {
             "compressed_entries": 0,
             "total_stored_bytes": 22,
             "total_logical_bytes": 22,
-            "sku_counts": [{ "sku_flags": "0x00000001", "count": 1 }],
+            "spec_counts": [{ "spec_flags": "0x00000001", "count": 1 }],
         })
     );
 }
@@ -71,7 +71,7 @@ fn info_json_reports_big_endian_archive_options() {
     )
     .unwrap();
     let val: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(val["schema"], 1);
+    assert_eq!(val["schema"], 2);
     assert_eq!(val["endian"], "big-endian");
     assert_eq!(val["segment_length"], 0x10_0000);
 }

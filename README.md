@@ -19,9 +19,9 @@ This tool is feature complete and will receive long-term maintenance. Please rep
 
 - **Cross-Platform Archive Support:** Reads single-file (`.dat`, `.000`) and multi-part (`.000`..`.NNN`) archives across PC and console releases, automatically detecting TOC byte order (`little` / `big`) and virtual segment strides.
 - **Filename Hash Resolution:** Resolves `CRC-32/BZIP2` path hashes through filelists you supply with `--filelist`, with `__unknown/<hash>.bin` fallback naming. No filelists are bundled.
-- **Archive Inspection & Filtering:** Reports part geometry, hash resolution coverage, and SKU distributions, and filters TOC entries by substring, glob pattern, unresolved status, or SKU bitmask.
+- **Archive Inspection & Filtering:** Reports part geometry, hash resolution coverage, and specialisation flag distributions, and filters TOC entries by substring, glob pattern, unresolved status, or spec mask.
 - **Single-Asset & Parallel Unpacking:** Transparently inflates `zlib`-compressed payloads (or exports raw bytes) to `stdout`, a single file, or a sanitized directory tree across worker threads.
-- **Structured JSON Output:** Emits versioned `"schema": 1` JSON across all subcommands for scripting and `jq` pipelines.
+- **Structured JSON Output:** Emits versioned `"schema": 2` JSON across all subcommands for scripting and `jq` pipelines.
 
 ## Installation
 
@@ -33,7 +33,13 @@ gh attestation verify lau-bigfun-<version>-x86_64-pc-windows-msvc.zip --repo Eit
 
 The executable is not code-signed, so Windows SmartScreen may warn the first time it runs.
 
-To build from source instead:
+On any platform with Rust, install it from crates.io:
+
+```bash
+cargo install lau-bigfun
+```
+
+Or build it from a checkout of this repository:
 
 ```bash
 # Install the `lau-bigfun` binary locally
@@ -60,14 +66,14 @@ Archives store only path hashes, so asset names come from filelists you supply w
 
 A filelist that names none of the archive's hashes, such as one for a different game or release, makes `list`, `extract` and `unpack` warn; `info` shows it as 0% resolved names.
 
-## TOC SKU Codes
+## TOC Specialisation Flags
 
-It is the responsibility of the operator or caller to translate and interpret bigfile entry SKU codes. Human-readable aliases have been intentionally excluded to keep this codebase agnostic across games and releases.
+It is the responsibility of the operator or caller to translate and interpret bigfile entry specialisation flags. Human-readable aliases have been intentionally excluded to keep this codebase agnostic across games and releases.
 
 ## Quick Start
 
 ```bash
-# Inspect archive summary, physical parts, hash resolution coverage, and SKU masks
+# Inspect archive summary, physical parts, hash resolution coverage, and specialisation flags
 lau-bigfun info /path/to/archive_dir_or_file --filelist names.txt
 
 # List TOC entries (filtered by substring, repeatable glob, or JSON output)
@@ -82,11 +88,11 @@ lau-bigfun list /path/to/bigfile.000 --limit 20
 lau-bigfun hash 'pc-w\lara.drm' 'pc-w\alister.drm'
 
 # Extract a single asset by path or hex hash (to a file or piped via stdout)
-lau-bigfun extract /path/to/bigfile.000 'pc-w\lara.drm' -o lara.drm --sku-mask 0x1
-lau-bigfun extract /path/to/bigfile.000 'pc-w\lara.drm' --sku-mask 0x1 | xxd | head
+lau-bigfun extract /path/to/bigfile.000 'pc-w\lara.drm' -o lara.drm --spec-mask 0x1
+lau-bigfun extract /path/to/bigfile.000 'pc-w\lara.drm' --spec-mask 0x1 | xxd | head
 
 # Unpack an entire archive (or filtered subset) to an output directory
-lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --sku-mask 0x1 --engine-sku-match
+lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --spec-mask 0x1 --engine-spec-match
 lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob 'pc-w/*.drm'
 ```
 
@@ -96,9 +102,9 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 
 | Subcommand | Description |
 | :--- | :--- |
-| `info <ARCHIVE>` | Display archive metadata, part geometry, hash resolution coverage, and SKU breakdown. |
+| `info <ARCHIVE>` | Display archive metadata, part geometry, hash resolution coverage, and specialisation flag breakdown. |
 | `list <ARCHIVE>` | List and filter Table of Contents (FAT) entries (`-l` / `--limit <N>`, default `50`; `0` = unlimited). When the limit hides entries, a note on `stderr` says how many matched. |
-| `extract <ARCHIVE> <TARGET>` | Extract a single entry by path or `0x<hash:08x>` to `-o <FILE>` or `stdout` (`--variant <N>` selects the 0-based index among `--sku-mask` matches; with neither it nor `--engine-sku-match`, it takes the first and, when several match, says how to choose). A failed read keeps an existing `<FILE>`; on `stdout` it can leave partial output and exits non-zero. |
+| `extract <ARCHIVE> <TARGET>` | Extract a single entry by path or `0x<hash:08x>` to `-o <FILE>` or `stdout` (`--variant <N>` selects the 0-based index among `--spec-mask` matches; with neither it nor `--engine-spec-match`, it takes the first and, when several match, says how to choose). A failed read keeps an existing `<FILE>`; on `stdout` it can leave partial output and exits non-zero. |
 | `unpack <ARCHIVE> -o <DIR>` | Unpack all or filtered entries across worker threads (`-j` / `--jobs <N>`, default `0` = auto-detect cores). |
 | `hash <PATH>...` | Compute the 32-bit `CRC-32/BZIP2` hash for one or more asset paths. |
 
@@ -113,16 +119,16 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 
 ### Filtering & Extraction Options
 
-`--filter`, `--glob`, and `--unresolved` are mutually exclusive on `list` and `unpack`, and can be combined with `--sku-mask`:
+`--filter`, `--glob`, and `--unresolved` are mutually exclusive on `list` and `unpack`, and can be combined with `--spec-mask`:
 
 | Option | Applies To | Description |
 | :--- | :--- | :--- |
 | `-f`, `--filter <STR>` | `list`, `unpack` | Case-insensitive substring match on resolved path or `0x<hash:08x>` (`/` and `\` are equivalent; leading slashes stripped). |
 | `-g`, `--glob <PATTERN>` | `list`, `unpack` | Repeatable whole-path, case-insensitive glob match (`*` matches within one folder, `**` crosses folders; any match counts). |
 | `--unresolved` | `list`, `unpack` | Select only entries whose hash is not resolved by the active filelist (`--filter` and `--glob` never match fallback labels). |
-| `--sku-mask <MASK>` | `list`, `extract`, `unpack` | Filter entries where `(entry.sku_flags & mask) == mask` (hex or decimal, e.g. `0x1`). |
-| `--engine-sku-match` | `extract`, `unpack` | For each name, select only the record the game engine's lookup order picks among those matching `--sku-mask` within this archive (requires `--sku-mask`; conflicts with `--variant`). |
-| `--variant-layout <MODE>` | `unpack` | Disambiguate colliding SKU variants via `sku-dir` (default, `sku_<hex>/` when ambiguous), `always-sku-dir`, or `suffix` (`.sku_<hex>`). |
+| `--spec-mask <MASK>` | `list`, `extract`, `unpack` | Filter entries where `(entry.spec_flags & mask) == mask` (hex or decimal, e.g. `0x1`). |
+| `--engine-spec-match` | `extract`, `unpack` | For each name, select only the record the game engine's lookup order picks among those matching `--spec-mask` within this archive (requires `--spec-mask`; conflicts with `--variant`). |
+| `--variant-layout <MODE>` | `unpack` | Disambiguate colliding specialisation variants via `spec-dir` (default, `spec_<hex>/` when ambiguous), `always-spec-dir`, or `suffix` (`.spec_<hex>`). |
 | `--raw` | `extract`, `unpack` | Write raw on-disk bytes without inflating `zlib`-compressed payloads. |
 | `--max-output-bytes <BYTES>` | `unpack` | Refuse to start if the planned output exceeds this many bytes (hex or decimal; `0` for no limit). Defaults to 16 times the size of the archive on disk, since records can share stored bytes and expand far beyond it. This bounds expansion; free disk space is not checked. |
 | `--dry-run` | `unpack` | Report the files and bytes the unpack would write, without writing anything. The count is bytes written, not the disk space their blocks take up, and a planned output over `--max-output-bytes` is reported with a warning instead of refused. The destination is not checked, so a real unpack can still fail to create or write it. |
@@ -133,7 +139,7 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 
 | Option | Description |
 | :--- | :--- |
-| `--json` | Emit a versioned `"schema": 1` root object on `stdout` (`info`, `list`, `hash`, `unpack`, and `extract -o <FILE>`). Pretty-printed on TTYs, compact when piped; errors remain plain text on `stderr`. `extract` reports `name` from a path target or, for a hash target, from `--filelist`, and `variant` as the index among all variants of the hash (reproducible with `--variant <N>` alone). `list` reports `total_matching`, the entries that matched before `--limit`. With `--dry-run`, `unpack` adds `"dry_run": true`, and its counts are what it would write. |
+| `--json` | Emit a versioned `"schema": 2` root object on `stdout` (`info`, `list`, `hash`, `unpack`, and `extract -o <FILE>`). Pretty-printed on TTYs, compact when piped; errors remain plain text on `stderr`. `extract` reports `name` from a path target or, for a hash target, from `--filelist`, and `variant` as the index among all variants of the hash (reproducible with `--variant <N>` alone). `list` reports `total_matching`, the entries that matched before `--limit`. With `--dry-run`, `unpack` adds `"dry_run": true`, and its counts are what it would write. |
 | `-q`, `--quiet` | Suppress non-error status messages on `stderr`. |
 
 ## Development

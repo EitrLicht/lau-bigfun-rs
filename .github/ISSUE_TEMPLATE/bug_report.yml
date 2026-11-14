@@ -11,7 +11,7 @@ body:
     attributes:
       label: Version
       description: Output of `lau-bigfun --version`.
-      placeholder: lau-bigfun 0.2.1
+      placeholder: lau-bigfun x.y.z
     validations:
       required: true
   - type: dropdown

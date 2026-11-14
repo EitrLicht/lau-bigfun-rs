@@ -12,25 +12,25 @@ use super::output::{
     write_json_stdout,
 };
 
-/// A record chosen by index among a hash's records that match `--sku-mask`.
+/// A record chosen by index among a hash's records that match `--spec-mask`.
 #[derive(Debug)]
 pub(super) struct VariantChoice<'a> {
     /// The chosen record.
     pub(super) entry: &'a Entry,
-    /// How many of the hash's records match `--sku-mask` (all of them without a mask).
+    /// How many of the hash's records match `--spec-mask` (all of them without a mask).
     pub(super) matching: usize,
 }
 
 pub(super) fn select_extract_variant(
     all_matches: &[Entry],
     hash: u32,
-    sku_mask: Option<u32>,
+    spec_mask: Option<u32>,
     variant: Option<usize>,
 ) -> Result<VariantChoice<'_>, String> {
     let idx = variant.unwrap_or(0);
     let mut chosen = None;
     let mut match_count = 0usize;
-    for (i, entry) in Fat::filter_sku_mask(all_matches, sku_mask).enumerate() {
+    for (i, entry) in Fat::filter_spec_mask(all_matches, spec_mask).enumerate() {
         if i == idx {
             chosen = Some(entry);
         }
@@ -42,26 +42,26 @@ pub(super) fn select_extract_variant(
             matching: match_count,
         })
         .ok_or_else(|| {
-            format_variant_selection_error(hash, sku_mask, idx, match_count, all_matches.len())
+            format_variant_selection_error(hash, spec_mask, idx, match_count, all_matches.len())
         })
 }
 
 fn format_variant_selection_error(
     hash: u32,
-    sku_mask: Option<u32>,
+    spec_mask: Option<u32>,
     idx: usize,
     match_count: usize,
     total_variants: usize,
 ) -> String {
-    if let Some(mask) = sku_mask.map(HexU32) {
+    if let Some(mask) = spec_mask.map(HexU32) {
         if match_count == 0 {
             format!(
-                "no variant of {} matches sku_mask {mask} ({total_variants} total variants exist)",
+                "no variant of {} matches --spec-mask {mask} ({total_variants} total variants exist)",
                 HexU32(hash)
             )
         } else {
             format!(
-                "--variant {idx} out of range (0..{}) for sku_mask {mask}",
+                "--variant {idx} out of range (0..{}) for --spec-mask {mask}",
                 match_count.saturating_sub(1)
             )
         }
@@ -101,26 +101,26 @@ struct ResolvedExtraction<'a> {
     name: Option<&'a str>,
     variant: usize,
     variant_count: usize,
-    /// When neither `--variant` nor `--engine-sku-match` chose a record, how many records
-    /// matched `--sku-mask`, the first of which extract took; `None` when the user chose.
+    /// When neither `--variant` nor `--engine-spec-match` chose a record, how many records
+    /// matched `--spec-mask`, the first of which extract took; `None` when the user chose.
     defaulted_among: Option<usize>,
 }
 
 impl ResolvedExtraction<'_> {
     /// Says how many variants the hash has and, when several matched and extract took the first,
     /// how to choose another.
-    fn variant_status(&self, sku_mask: Option<u32>) -> String {
+    fn variant_status(&self, spec_mask: Option<u32>) -> String {
         let summary = format!(
             "{} variant(s) for {}",
             self.variant_count,
             HexU32(self.hash)
         );
-        match (self.defaulted_among, sku_mask) {
+        match (self.defaulted_among, spec_mask) {
             (Some(matching), None) if matching > 1 => format!(
-                "{summary}; extracting the first (choose with --variant <N>, or --sku-mask <MASK> --engine-sku-match for the engine's pick)"
+                "{summary}; extracting the first (choose with --variant <N>, or --spec-mask <MASK> --engine-spec-match for the engine's pick)"
             ),
             (Some(matching), Some(mask)) if matching > 1 => format!(
-                "{summary}, {matching} matching sku_mask {}; extracting the first (choose with --variant <N>, or --engine-sku-match for the engine's pick)",
+                "{summary}, {matching} matching --spec-mask {}; extracting the first (choose with --variant <N>, or --engine-spec-match for the engine's pick)",
                 HexU32(mask)
             ),
             _ => summary,
@@ -143,20 +143,21 @@ fn resolve_extract_entry<'a>(
     if all_matches.is_empty() {
         return Err(format_not_found_error(hash, label).into());
     }
-    let (entry, defaulted_among) = match args.sku.mask.filter(|_| args.resolution.engine_sku_match)
-    {
-        Some(mask) => {
-            let entry = archive.find_with_sku_mask(hash, mask).ok_or_else(|| {
-                format_variant_selection_error(hash, Some(mask), 0, 0, all_matches.len())
-            })?;
-            (entry, None)
-        }
-        None => {
-            let choice = select_extract_variant(all_matches, hash, args.sku.mask, args.variant)?;
-            let defaulted = args.variant.is_none().then_some(choice.matching);
-            (choice.entry, defaulted)
-        }
-    };
+    let (entry, defaulted_among) =
+        match args.spec.mask.filter(|_| args.resolution.engine_spec_match) {
+            Some(mask) => {
+                let entry = archive.find_with_spec_mask(hash, mask).ok_or_else(|| {
+                    format_variant_selection_error(hash, Some(mask), 0, 0, all_matches.len())
+                })?;
+                (entry, None)
+            }
+            None => {
+                let choice =
+                    select_extract_variant(all_matches, hash, args.spec.mask, args.variant)?;
+                let defaulted = args.variant.is_none().then_some(choice.matching);
+                (choice.entry, defaulted)
+            }
+        };
     Ok(ResolvedExtraction {
         archive,
         entry,
@@ -207,9 +208,9 @@ fn write_extract_destination<W: Write, E: Write>(
         ),
     };
     status.println(format_args!(
-        "wrote {written} bytes to {place} (record #{}, sku={})",
+        "wrote {written} bytes to {place} (record #{}, spec={})",
         entry.index,
-        HexU32(entry.sku_flags)
+        HexU32(entry.spec_flags)
     ));
     Ok(written)
 }
@@ -247,7 +248,7 @@ pub(super) fn run_extract<W: Write, E: Write>(
     let archive = args.archive.open()?;
     warn_if_names_miss_archive(&dict, &archive, status);
     let res = resolve_extract_entry(&archive, args, &dict)?;
-    status.println(format_args!("{}", res.variant_status(args.sku.mask)));
+    status.println(format_args!("{}", res.variant_status(args.spec.mask)));
     let bytes_written =
         write_extract_destination(&res, destination, out, status, args.payload.raw)?;
     if let (OutputMode::Json { pretty }, ExtractDestination::File(output_path)) =
@@ -271,8 +272,8 @@ fn write_extract_report<W: Write>(
         index: res.entry.index,
         name_hash: HexU32(res.entry.name_hash),
         name: res.name,
-        sku_flags: HexU32(res.entry.sku_flags),
-        sku_mask: args.sku.mask.map(HexU32),
+        spec_flags: HexU32(res.entry.spec_flags),
+        spec_mask: args.spec.mask.map(HexU32),
         variant: res.variant,
         variant_count: res.variant_count,
         raw: args.payload.raw,

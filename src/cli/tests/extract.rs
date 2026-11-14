@@ -83,7 +83,7 @@ fn extract_streams_to_stdout_when_omitted_or_dash() {
     assert_eq!(out, SYNTHETIC_PAYLOAD);
     assert_eq!(
         err,
-        "1 variant(s) for 0x5ff91900\nwrote 22 bytes to stdout (record #0, sku=0x00000001)\n"
+        "1 variant(s) for 0x5ff91900\nwrote 22 bytes to stdout (record #0, spec=0x00000001)\n"
     );
 
     let (q_out, q_err) =
@@ -127,8 +127,8 @@ fn extract_reports_missing_target_error() {
     }
 }
 
-/// Writes an archive holding three `pc-w\lara.drm` variants, for SKUs `0x1`, `0x3` and `0x7`,
-/// returning its temporary directory and path.
+/// Writes an archive holding three `pc-w\lara.drm` variants, with spec flags `0x1`, `0x3` and
+/// `0x7`, returning its temporary directory and path.
 fn create_three_variant_archive(prefix: &str) -> (TempDir, PathBuf) {
     let dir = TempDir::new(prefix);
     let archive_path = dir.join("bigfile.000");
@@ -165,30 +165,30 @@ fn extract_hints_how_to_choose_when_several_variants_match() {
     let status = extract_lara_status(&archive, &[]);
     assert!(
         status.contains(
-            "3 variant(s) for 0x5ff91900; extracting the first (choose with --variant <N>, or --sku-mask <MASK> --engine-sku-match for the engine's pick)"
+            "3 variant(s) for 0x5ff91900; extracting the first (choose with --variant <N>, or --spec-mask <MASK> --engine-spec-match for the engine's pick)"
         ),
         "{status}"
     );
 }
 
 #[test]
-fn extract_hint_counts_only_variants_matching_the_sku_mask() {
+fn extract_hint_counts_only_variants_matching_the_spec_mask() {
     let (_dir, archive) = create_three_variant_archive("extract_hint_mask");
 
-    let status = extract_lara_status(&archive, &["--sku-mask", "0x3"]);
+    let status = extract_lara_status(&archive, &["--spec-mask", "0x3"]);
     assert!(
         status.contains(
-            "3 variant(s) for 0x5ff91900, 2 matching sku_mask 0x00000003; extracting the first (choose with --variant <N>, or --engine-sku-match for the engine's pick)"
+            "3 variant(s) for 0x5ff91900, 2 matching --spec-mask 0x00000003; extracting the first (choose with --variant <N>, or --engine-spec-match for the engine's pick)"
         ),
         "{status}"
     );
 }
 
 #[test]
-fn extract_does_not_hint_when_the_sku_mask_leaves_one_variant() {
+fn extract_does_not_hint_when_the_spec_mask_leaves_one_variant() {
     let (_dir, archive) = create_three_variant_archive("extract_hint_one");
 
-    let status = extract_lara_status(&archive, &["--sku-mask", "0x7"]);
+    let status = extract_lara_status(&archive, &["--spec-mask", "0x7"]);
     assert!(!status.contains("extracting the first"), "{status}");
 }
 
@@ -201,15 +201,15 @@ fn extract_does_not_hint_when_a_variant_is_chosen() {
 }
 
 #[test]
-fn extract_does_not_hint_with_the_engine_sku_match() {
+fn extract_does_not_hint_with_the_engine_spec_match() {
     let (_dir, archive) = create_three_variant_archive("extract_hint_engine");
 
-    let status = extract_lara_status(&archive, &["--sku-mask", "0x3", "--engine-sku-match"]);
+    let status = extract_lara_status(&archive, &["--spec-mask", "0x3", "--engine-spec-match"]);
     assert!(!status.contains("extracting the first"), "{status}");
 }
 
 #[test]
-fn select_extract_variant_filters_by_sku_mask() {
+fn select_extract_variant_filters_by_spec_mask() {
     let h = 0x5FF9_1900;
     let entries = [sample_entry(0, h, 1, 0b0001), sample_entry(1, h, 1, 0b0011)];
     for (mask, var, expected_idx) in [(None, None, 0), (None, Some(1), 1), (Some(3), None, 1)] {
@@ -226,12 +226,12 @@ fn select_extract_variant_filters_by_sku_mask() {
         (
             Some(3),
             Some(1),
-            "out of range (0..0) for sku_mask 0x00000003",
+            "out of range (0..0) for --spec-mask 0x00000003",
         ),
         (
             Some(4),
             None,
-            "no variant of 0x5ff91900 matches sku_mask 0x00000004",
+            "no variant of 0x5ff91900 matches --spec-mask 0x00000004",
         ),
     ] {
         assert!(
@@ -275,12 +275,12 @@ fn extract_json_writes_file_payload_with_stdout_metadata() {
     assert_eq!(
         val,
         serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "index": 0,
             "name_hash": "0x5ff91900",
             "name": r"pc-w\lara.drm",
-            "sku_flags": "0x00000001",
-            "sku_mask": null,
+            "spec_flags": "0x00000001",
+            "spec_mask": null,
             "variant": 0,
             "variant_count": 1,
             "raw": false,
@@ -298,13 +298,13 @@ fn extract_json_names_hash_target_from_filelist() {
     let extra = [
         "--filelist",
         filelist.to_str().unwrap(),
-        "--sku-mask",
+        "--spec-mask",
         "0x1",
     ];
 
     let val = extract_json_report(&dir, a, "0x5ff91900", &extra);
     assert_eq!(val["name"], r"pc-w\lara.drm");
-    assert_eq!(val["sku_mask"], "0x00000001");
+    assert_eq!(val["spec_mask"], "0x00000001");
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn extract_json_rejects_stdout_payload_destinations() {
     }
 }
 
-/// Writes an archive of three records sharing `hash`, each matching SKU mask `1`.
+/// Writes an archive of three records sharing `hash`, each matching spec mask `1`.
 fn create_shared_hash_archive(hash: u32) -> (TempDir, PathBuf) {
     let dir = TempDir::new("shared_hash");
     let records =
@@ -357,7 +357,7 @@ fn extract_single_part_reads_a_later_numbered_archive() {
 }
 
 #[test]
-fn extract_engine_sku_match_reports_total_variants_when_no_record_passes_mask() {
+fn extract_engine_spec_match_reports_total_variants_when_no_record_passes_mask() {
     let (_dir, archive_path) = create_shared_hash_archive(0x1000);
     let archive = archive_path.to_str().unwrap();
     let argv = [
@@ -366,9 +366,9 @@ fn extract_engine_sku_match_reports_total_variants_when_no_record_passes_mask() 
         "0x00001000",
         "-o",
         "-",
-        "--sku-mask",
+        "--spec-mask",
         "2",
-        "--engine-sku-match",
+        "--engine-spec-match",
     ];
 
     let err = exec_args(&argv, false).unwrap_err();
@@ -376,7 +376,7 @@ fn extract_engine_sku_match_reports_total_variants_when_no_record_passes_mask() 
 }
 
 #[test]
-fn extract_engine_sku_match_selects_landing_record() {
+fn extract_engine_spec_match_selects_landing_record() {
     let (_dir, archive_path) = create_shared_hash_archive(0x1000);
     let archive = archive_path.to_str().unwrap();
     let argv = [
@@ -385,14 +385,14 @@ fn extract_engine_sku_match_selects_landing_record() {
         "0x00001000",
         "-o",
         "-",
-        "--sku-mask",
+        "--spec-mask",
         "1",
     ];
 
     let (default_out, _) = exec_args(&argv, false).unwrap();
     assert_eq!(default_out, b"first_");
 
-    let engine_argv = [argv.as_slice(), &["--engine-sku-match"]].concat();
+    let engine_argv = [argv.as_slice(), &["--engine-spec-match"]].concat();
     let (engine_out, _) = exec_args(&engine_argv, false).unwrap();
     assert_eq!(engine_out, b"second");
 }

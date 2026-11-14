@@ -20,7 +20,7 @@ use crate::format::{Endian, SECTOR_BYTE_COUNT, fat_byte_len, sector_logical_offs
 #[derive(Clone, Copy)]
 pub(crate) struct ArchiveRecord<'a> {
     pub(crate) hash: u32,
-    sku_flags: u32,
+    spec_flags: u32,
     payload: &'a [u8],
     /// Size the TOC declares: the payload's length when stored, the inflated size when compressed.
     size: u32,
@@ -29,10 +29,10 @@ pub(crate) struct ArchiveRecord<'a> {
 
 impl<'a> ArchiveRecord<'a> {
     /// Record whose `payload` is stored as it is.
-    pub(crate) const fn stored(hash: u32, sku_flags: u32, payload: &'a [u8]) -> Self {
+    pub(crate) const fn stored(hash: u32, spec_flags: u32, payload: &'a [u8]) -> Self {
         Self {
             hash,
-            sku_flags,
+            spec_flags,
             payload,
             size: payload.len() as u32,
             compressed: false,
@@ -43,27 +43,27 @@ impl<'a> ArchiveRecord<'a> {
     /// match what the stream inflates to.
     pub(crate) const fn zlib(
         hash: u32,
-        sku_flags: u32,
+        spec_flags: u32,
         zlib: &'a [u8],
         inflated_size: u32,
     ) -> Self {
         Self {
             hash,
-            sku_flags,
+            spec_flags,
             payload: zlib,
             size: inflated_size,
             compressed: true,
         }
     }
 
-    /// The record's `(name_hash, size, sector_number, sku_flags, deflated_size)` TOC fields.
+    /// The record's `(name_hash, size, sector_number, spec_flags, deflated_size)` TOC fields.
     const fn toc_fields(&self, sector: u32) -> (u32, u32, u32, u32, i32) {
         let deflated = if self.compressed {
             self.payload.len() as i32
         } else {
             0
         };
-        (self.hash, self.size, sector, self.sku_flags, deflated)
+        (self.hash, self.size, sector, self.spec_flags, deflated)
     }
 }
 
@@ -131,17 +131,17 @@ const fn encode_u32(endian: Endian, value: u32) -> [u8; 4] {
 }
 
 /// Serializes a bigfile FAT header (`count`, `hashes[count]`, `records[count]`) in `endian`
-/// byte order from `(name_hash, size, sector_number, sku_flags, deflated_size)` tuples.
+/// byte order from `(name_hash, size, sector_number, spec_flags, deflated_size)` tuples.
 pub(crate) fn build_fat_bytes(endian: Endian, records: &[(u32, u32, u32, u32, i32)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(fat_byte_len(records.len()).unwrap());
     buf.extend_from_slice(&encode_u32(endian, records.len() as u32));
     for &(hash, _, _, _, _) in records {
         buf.extend_from_slice(&encode_u32(endian, hash));
     }
-    for &(_, size, sector, sku, deflated) in records {
+    for &(_, size, sector, spec, deflated) in records {
         buf.extend_from_slice(&encode_u32(endian, size));
         buf.extend_from_slice(&encode_u32(endian, sector));
-        buf.extend_from_slice(&encode_u32(endian, sku));
+        buf.extend_from_slice(&encode_u32(endian, spec));
         buf.extend_from_slice(&encode_u32(endian, deflated as u32));
     }
     buf
@@ -183,13 +183,13 @@ pub(crate) fn write_shared_sector_archive(path: impl AsRef<Path>, records: &[(u3
 }
 
 /// An uncompressed 10-byte [`Entry`] for tests that need entries without an archive.
-pub(crate) const fn sample_entry(index: usize, name_hash: u32, sector: u32, sku: u32) -> Entry {
+pub(crate) const fn sample_entry(index: usize, name_hash: u32, sector: u32, spec: u32) -> Entry {
     Entry {
         index,
         name_hash,
         size: 10,
         sector_number: sector,
-        sku_flags: sku,
+        spec_flags: spec,
         deflated_size: 0,
     }
 }
@@ -210,7 +210,7 @@ pub(crate) fn write_archive(path: impl AsRef<Path>, endian: Endian, records: &[A
 }
 
 /// Writes each `(file name, hash)` under `dir` as a separate archive holding one stored record of
-/// `hash` with SKU flags `1` and the bytes `b"payload"`.
+/// `hash` with spec flags `1` and the bytes `b"payload"`.
 pub(crate) fn write_one_record_archives(dir: &Path, archives: &[(&str, u32)]) {
     for &(name, hash) in archives {
         let record = ArchiveRecord::stored(hash, 1, b"payload");

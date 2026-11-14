@@ -39,16 +39,16 @@ impl<'a> ArchiveSet<'a> {
         self.archives
     }
 
-    /// Asks the archives in order and returns the first record [`Bigfile::find_with_sku_mask`]
-    /// selects. A record must pass `sku_mask`, so a name whose records in one archive all fail falls
+    /// Asks the archives in order and returns the first record [`Bigfile::find_with_spec_mask`]
+    /// selects. A record must pass `spec_mask`, so a name whose records in one archive all fail falls
     /// through to the next archive in the order.
     #[must_use]
-    pub fn resolve(self, name_hash: u32, sku_mask: u32) -> Option<ResolvedEntry<'a>> {
+    pub fn resolve(self, name_hash: u32, spec_mask: u32) -> Option<ResolvedEntry<'a>> {
         self.archives
             .iter()
             .enumerate()
             .find_map(|(archive_rank, archive)| {
-                let entry = archive.find_with_sku_mask(name_hash, sku_mask)?;
+                let entry = archive.find_with_spec_mask(name_hash, spec_mask)?;
                 Some(ResolvedEntry {
                     archive,
                     archive_rank,

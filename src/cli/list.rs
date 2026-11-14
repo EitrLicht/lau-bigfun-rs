@@ -14,7 +14,7 @@ fn matching_list_entries<'a>(
     args: &'a ListArgs,
     filter: Option<&'a EntryFilter>,
 ) -> impl Iterator<Item = Result<ListEntryRecord<'a>, BigfileError>> + 'a {
-    Fat::filter_sku_mask(bf.entries(), args.sku.mask).filter_map(move |entry| {
+    Fat::filter_spec_mask(bf.entries(), args.spec.mask).filter_map(move |entry| {
         let name = dict.get(entry.name_hash);
         if filter.is_some_and(|f| !f.matches(entry.name_hash, name)) {
             return None;
@@ -32,7 +32,7 @@ fn matching_list_entries<'a>(
                     sector_number: entry.sector_number,
                     part_index,
                     offset_in_part,
-                    sku_flags: HexU32(entry.sku_flags),
+                    spec_flags: HexU32(entry.spec_flags),
                 }),
         )
     })
@@ -58,13 +58,13 @@ fn escape_control_chars(name: &str) -> Cow<'_, str> {
 fn write_list_entry<W: Write>(out: &mut W, record: &ListEntryRecord<'_>) -> io::Result<()> {
     writeln!(
         out,
-        "  {}  size={:<10} sector={:<10} part={:03}@{:#010x} sku={} deflated={:<8} {}",
+        "  {}  size={:<10} sector={:<10} part={:03}@{:#010x} spec={} deflated={:<8} {}",
         record.name_hash,
         record.size,
         record.sector_number,
         record.part_index,
         record.offset_in_part,
-        record.sku_flags,
+        record.spec_flags,
         record.deflated_size,
         escape_control_chars(record.name.unwrap_or("<unknown>"))
     )

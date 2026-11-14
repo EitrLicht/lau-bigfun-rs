@@ -29,7 +29,7 @@ fn hash_json_emits_filename_hash_records() {
     assert_eq!(
         val,
         serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "entries": [
                 { "name": r"pc-w\lara.drm", "name_hash": "0x5ff91900" },
                 { "name": r"pc-w\alister.drm", "name_hash": "0x1de5357f" },

@@ -69,7 +69,7 @@ fn list_limit_counts_only_entries_matching_the_filters() {
         archive_path.to_str().unwrap(),
         "-l",
         "1",
-        "--sku-mask",
+        "--spec-mask",
         "1",
     ];
 
@@ -209,7 +209,7 @@ fn list_json_serializes_resolved_or_null_entry_names() {
     assert_eq!(
         val,
         serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "total_matching": 1,
             "entries": [{
                 "index": 0,
@@ -222,7 +222,7 @@ fn list_json_serializes_resolved_or_null_entry_names() {
                 "sector_number": 1,
                 "part_index": 0,
                 "offset_in_part": 2048,
-                "sku_flags": "0x00000001",
+                "spec_flags": "0x00000001",
             }],
         })
     );

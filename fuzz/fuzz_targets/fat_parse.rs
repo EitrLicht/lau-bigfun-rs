@@ -7,12 +7,12 @@ use libfuzzer_sys::fuzz_target;
 
 /// The single-record lookup must find a record exactly when the run holds a matching one.
 fn assert_lookup_agrees_with_filter(fat: &Fat, hash: u32, mask: u32) {
-    let found = fat.find_with_sku_mask(hash, mask);
+    let found = fat.find_with_spec_mask(hash, mask);
     assert_eq!(
         found.is_some(),
-        fat.find_all_with_sku_mask(hash, mask).next().is_some()
+        fat.find_all_with_spec_mask(hash, mask).next().is_some()
     );
-    assert!(found.is_none_or(|entry| entry.name_hash == hash && entry.matches_sku_mask(mask)));
+    assert!(found.is_none_or(|entry| entry.name_hash == hash && entry.matches_spec_mask(mask)));
 }
 
 fn exercise(fat: &Fat) {
@@ -23,8 +23,8 @@ fn exercise(fat: &Fat) {
             entry.is_compressed(),
         );
         let _ = fat.find_all(entry.name_hash);
-        assert_lookup_agrees_with_filter(fat, entry.name_hash, entry.sku_flags);
-        assert_lookup_agrees_with_filter(fat, entry.name_hash, entry.sku_flags ^ 1);
+        assert_lookup_agrees_with_filter(fat, entry.name_hash, entry.spec_flags);
+        assert_lookup_agrees_with_filter(fat, entry.name_hash, entry.spec_flags ^ 1);
     }
     for run in fat.hash_runs() {
         assert!(run.iter().all(|entry| entry.name_hash == run[0].name_hash));

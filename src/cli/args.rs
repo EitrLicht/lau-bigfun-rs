@@ -33,19 +33,19 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliVariantLayout {
-    /// Put unique hashes at `<out>/<path>` and multi-variant hashes under `<out>/sku_<hex>/<path>`
-    SkuDir,
-    /// Always put every entry under `<out>/sku_<hex>/<path>`
-    AlwaysSkuDir,
-    /// Keep flat paths and append `.sku_<hex>` before the file extension when ambiguous
+    /// Put unique hashes at `<out>/<path>` and multi-variant hashes under `<out>/spec_<hex>/<path>`
+    SpecDir,
+    /// Always put every entry under `<out>/spec_<hex>/<path>`
+    AlwaysSpecDir,
+    /// Keep flat paths and append `.spec_<hex>` before the file extension when ambiguous
     Suffix,
 }
 
 impl From<CliVariantLayout> for VariantLayout {
     fn from(value: CliVariantLayout) -> Self {
         match value {
-            CliVariantLayout::SkuDir => VariantLayout::SkuSubdirWhenAmbiguous,
-            CliVariantLayout::AlwaysSkuDir => VariantLayout::AlwaysSkuSubdir,
+            CliVariantLayout::SpecDir => VariantLayout::SpecSubdirWhenAmbiguous,
+            CliVariantLayout::AlwaysSpecDir => VariantLayout::AlwaysSpecSubdir,
             CliVariantLayout::Suffix => VariantLayout::FilenameSuffix,
         }
     }
@@ -76,7 +76,8 @@ impl From<CliEndian> for Option<Endian> {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
-    /// Display archive metadata, part geometry, hash dictionary coverage, and SKU breakdown
+    /// Display archive metadata, part geometry, hash dictionary coverage, and specialisation flag
+    /// breakdown
     Info(InfoArgs),
 
     /// List entries in the bigfile Table of Contents (FAT)
@@ -140,11 +141,11 @@ pub(crate) fn with_flag_hint(err: BigfileError) -> Box<dyn std::error::Error> {
     format!("{err}{hint}").into()
 }
 
-/// Shared CLI argument for filtering entries by SKU.
+/// Shared CLI argument for filtering entries by specialisation flags.
 #[derive(Args, Debug, Clone, Copy, Default)]
-pub(crate) struct SkuMaskArgs {
-    /// Filter entries by SKU mask `(entry.sku_flags & mask) == mask` (hex or decimal, e.g. 0x1)
-    #[arg(id = "sku_mask", long = "sku-mask", value_name = "SKU_MASK", value_parser = parse_uint_auto::<u32>)]
+pub(crate) struct SpecMaskArgs {
+    /// Filter entries by spec mask `(entry.spec_flags & mask) == mask` (hex or decimal, e.g. 0x1)
+    #[arg(id = "spec_mask", long = "spec-mask", value_name = "SPEC_MASK", value_parser = parse_uint_auto::<u32>)]
     pub(crate) mask: Option<u32>,
 }
 
@@ -152,9 +153,9 @@ pub(crate) struct SkuMaskArgs {
 #[derive(Args, Debug, Clone, Copy, Default)]
 pub(crate) struct ResolutionArgs {
     /// For each name, select only the record the game engine's lookup order picks among those
-    /// matching `--sku-mask` within this archive (requires `--sku-mask`)
-    #[arg(long, requires = "sku_mask")]
-    pub(crate) engine_sku_match: bool,
+    /// matching `--spec-mask` within this archive (requires `--spec-mask`)
+    #[arg(long, requires = "spec_mask")]
+    pub(crate) engine_spec_match: bool,
 }
 
 /// Shared CLI argument for writing stored bytes as they are.
@@ -298,7 +299,7 @@ pub(crate) struct ListArgs {
     pub(crate) archive: ArchiveArgs,
 
     #[command(flatten)]
-    pub(crate) sku: SkuMaskArgs,
+    pub(crate) spec: SpecMaskArgs,
 
     #[command(flatten)]
     pub(crate) filter: FilterArgs,
@@ -324,12 +325,12 @@ pub(crate) struct ExtractArgs {
     #[arg(short, long)]
     pub(crate) output: Option<PathBuf>,
 
-    /// Select variant by index (0..N-1) among matching entries (filtered by `--sku-mask` when set)
-    #[arg(long, conflicts_with = "engine_sku_match")]
+    /// Select variant by index (0..N-1) among matching entries (filtered by `--spec-mask` when set)
+    #[arg(long, conflicts_with = "engine_spec_match")]
     pub(crate) variant: Option<usize>,
 
     #[command(flatten)]
-    pub(crate) sku: SkuMaskArgs,
+    pub(crate) spec: SpecMaskArgs,
 
     #[command(flatten)]
     pub(crate) resolution: ResolutionArgs,
@@ -351,13 +352,13 @@ pub(crate) struct UnpackArgs {
     pub(crate) output: PathBuf,
 
     #[command(flatten)]
-    pub(crate) sku: SkuMaskArgs,
+    pub(crate) spec: SpecMaskArgs,
 
     #[command(flatten)]
     pub(crate) resolution: ResolutionArgs,
 
-    /// How to disambiguate multiple SKU variants that share the same filename hash
-    #[arg(long, value_enum, default_value_t = CliVariantLayout::SkuDir)]
+    /// How to disambiguate multiple specialisation variants that share the same filename hash
+    #[arg(long, value_enum, default_value_t = CliVariantLayout::SpecDir)]
     pub(crate) variant_layout: CliVariantLayout,
 
     #[command(flatten)]

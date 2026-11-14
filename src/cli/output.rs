@@ -25,7 +25,10 @@ pub(crate) fn is_stdout_broken_pipe(err: &(dyn std::error::Error + 'static)) -> 
         .is_some_and(StdoutError::is_broken_pipe)
 }
 
-pub(crate) const JSON_SCHEMA_VERSION: u32 = 1;
+/// Version of the `--json` output's shape, written as its `"schema"` field. One version covers
+/// every command, and it is raised whenever any command's fields are renamed or change meaning
+/// (2: `sku_*` fields became `spec_*`).
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputMode {
@@ -110,8 +113,8 @@ pub(crate) struct PartJson<'a> {
 }
 
 #[derive(Serialize)]
-pub(crate) struct SkuCountJson {
-    pub(crate) sku_flags: HexU32,
+pub(crate) struct SpecCountJson {
+    pub(crate) spec_flags: HexU32,
     pub(crate) count: usize,
 }
 
@@ -130,7 +133,7 @@ pub(crate) struct InfoJsonReport<'a> {
     pub(crate) compressed_entries: usize,
     pub(crate) total_stored_bytes: u64,
     pub(crate) total_logical_bytes: u64,
-    pub(crate) sku_counts: Vec<SkuCountJson>,
+    pub(crate) spec_counts: Vec<SpecCountJson>,
 }
 
 #[derive(Serialize)]
@@ -155,7 +158,7 @@ pub(crate) struct ListEntryRecord<'a> {
     pub(crate) sector_number: u32,
     pub(crate) part_index: usize,
     pub(crate) offset_in_part: u64,
-    pub(crate) sku_flags: HexU32,
+    pub(crate) spec_flags: HexU32,
 }
 
 #[derive(Serialize)]
@@ -164,8 +167,8 @@ pub(crate) struct ExtractJsonReport<'a> {
     pub(crate) index: usize,
     pub(crate) name_hash: HexU32,
     pub(crate) name: Option<&'a str>,
-    pub(crate) sku_flags: HexU32,
-    pub(crate) sku_mask: Option<HexU32>,
+    pub(crate) spec_flags: HexU32,
+    pub(crate) spec_mask: Option<HexU32>,
     pub(crate) variant: usize,
     pub(crate) variant_count: usize,
     pub(crate) raw: bool,

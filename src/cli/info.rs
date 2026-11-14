@@ -7,7 +7,7 @@ use lau_bigfun::{Bigfile, HashDictionary};
 
 use super::args::{InfoArgs, name_coverage};
 use super::output::{
-    HexU32, InfoJsonReport, JSON_SCHEMA_VERSION, OutputMode, PartJson, SkuCountJson, StdoutError,
+    HexU32, InfoJsonReport, JSON_SCHEMA_VERSION, OutputMode, PartJson, SpecCountJson, StdoutError,
     write_json_stdout,
 };
 
@@ -17,7 +17,7 @@ struct ArchiveStats {
     compressed_count: usize,
     total_logical_bytes: u64,
     total_stored_bytes: u64,
-    sku_counts: BTreeMap<u32, usize>,
+    spec_counts: BTreeMap<u32, usize>,
 }
 
 impl ArchiveStats {
@@ -34,13 +34,13 @@ impl ArchiveStats {
 
 fn compute_archive_stats(bf: &Bigfile, dict: &HashDictionary) -> ArchiveStats {
     let coverage = name_coverage(dict, bf);
-    let mut sku_counts: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut spec_counts: BTreeMap<u32, usize> = BTreeMap::new();
     let mut compressed_count = 0usize;
     let mut total_logical_bytes = 0u64;
     let mut total_stored_bytes = 0u64;
 
     for e in bf.entries() {
-        *sku_counts.entry(e.sku_flags).or_insert(0) += 1;
+        *spec_counts.entry(e.spec_flags).or_insert(0) += 1;
         if e.is_compressed() {
             compressed_count += 1;
         }
@@ -54,7 +54,7 @@ fn compute_archive_stats(bf: &Bigfile, dict: &HashDictionary) -> ArchiveStats {
         compressed_count,
         total_logical_bytes,
         total_stored_bytes,
-        sku_counts,
+        spec_counts,
     }
 }
 
@@ -99,9 +99,9 @@ fn write_archive_info<W: Write>(
     writeln!(out, "Compressed entries:   {}", stats.compressed_count)?;
     writeln!(out, "Total stored bytes:   {}", stats.total_stored_bytes)?;
     writeln!(out, "Total logical bytes:  {}", stats.total_logical_bytes)?;
-    writeln!(out, "Distinct SKU masks:   {}", stats.sku_counts.len())?;
-    for (&sku, cnt) in &stats.sku_counts {
-        writeln!(out, "  sku={} -> {cnt} entries", HexU32(sku))?;
+    writeln!(out, "Distinct spec flags:  {}", stats.spec_counts.len())?;
+    for (&spec, cnt) in &stats.spec_counts {
+        writeln!(out, "  spec={} -> {cnt} entries", HexU32(spec))?;
     }
     out.flush()?;
     Ok(())
@@ -135,11 +135,11 @@ fn write_archive_info_json<W: Write>(
         compressed_entries: stats.compressed_count,
         total_stored_bytes: stats.total_stored_bytes,
         total_logical_bytes: stats.total_logical_bytes,
-        sku_counts: stats
-            .sku_counts
+        spec_counts: stats
+            .spec_counts
             .iter()
-            .map(|(&sku, &count)| SkuCountJson {
-                sku_flags: HexU32(sku),
+            .map(|(&spec, &count)| SpecCountJson {
+                spec_flags: HexU32(spec),
                 count,
             })
             .collect(),

@@ -85,7 +85,7 @@ fn resolve_through_patch(dir: &Path, bf: Bigfile) {
     let archives = [patch, bf];
     let set = ArchiveSet::new(&archives);
     for entry in archives[1].entries().iter().take(MAX_ENTRIES) {
-        let resolved = set.resolve(entry.name_hash, entry.sku_flags).unwrap();
+        let resolved = set.resolve(entry.name_hash, entry.spec_flags).unwrap();
         assert_eq!(resolved.archive_rank, 0);
     }
 }

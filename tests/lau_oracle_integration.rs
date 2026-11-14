@@ -41,8 +41,8 @@ struct OracleSpec {
     engine_lookups: &'static [EngineLookupVector],
 }
 
-/// Records [`Bigfile::find_with_sku_mask`] must return for `path` in `archive`, where the record at
-/// position `n` of `records_by_mask_bit` is expected for the mask `1 << n`, and how many lookups
+/// Records [`Bigfile::find_with_spec_mask`] must return for `path` in `archive`, where the record
+/// at position `n` of `records_by_mask_bit` is expected for the mask `1 << n`, and how many lookups
 /// over those mask bits differ from the first matching record across all multi-record hashes.
 struct EngineLookupVector {
     archive: &'static str,
@@ -359,7 +359,7 @@ fn assert_reads_across_all_parts(spec: &OracleSpec) {
     let lara_hash = name_hash(r"pc-w\lara.drm").unwrap();
     let lara_matches = bf.find(lara_hash);
     let lara_entry = bf
-        .find_with_sku_mask(lara_hash, lara_matches[0].sku_flags)
+        .find_with_spec_mask(lara_hash, lara_matches[0].spec_flags)
         .unwrap();
     assert_eq!(
         crc32fast::hash(&read_checked(lara_entry)),
@@ -375,8 +375,8 @@ fn count_lookups_differing_from_first_match(bf: &Bigfile, mask_bits: usize) -> u
     for run in bf.hash_runs().filter(|run| run.len() > 1) {
         for bit in 0..mask_bits {
             let mask = 1u32 << bit;
-            let found = bf.find_with_sku_mask(run[0].name_hash, mask).unwrap();
-            let first = Fat::filter_sku_mask(run, Some(mask)).next();
+            let found = bf.find_with_spec_mask(run[0].name_hash, mask).unwrap();
+            let first = Fat::filter_spec_mask(run, Some(mask)).next();
             differing += usize::from(first.map(|entry| entry.index) != Some(found.index));
         }
     }
@@ -391,7 +391,7 @@ fn assert_engine_lookups(spec: &OracleSpec) {
         let bf = open_archive(&archive_dir.join(vector.archive));
         let hash = name_hash(vector.path).unwrap();
         for (bit, &record) in vector.records_by_mask_bit.iter().enumerate() {
-            let found = bf.find_with_sku_mask(hash, 1 << bit).unwrap();
+            let found = bf.find_with_spec_mask(hash, 1 << bit).unwrap();
             assert_eq!(found.index, record, "{} mask bit {bit}", vector.archive);
         }
         assert_eq!(
@@ -449,7 +449,7 @@ fn tru_locals_resolves_to_patch_flags_for_mask_0x20() {
     let set = ArchiveSet::new(&archives);
     let hash = name_hash(r"pc-w\local\locals.bin").unwrap();
     assert_eq!(
-        set.resolve(hash, 0x20).unwrap().entry.sku_flags,
+        set.resolve(hash, 0x20).unwrap().entry.spec_flags,
         0xFFFF_F7E1
     );
 }
@@ -467,7 +467,7 @@ fn tru_unpatched_names_resolve_from_bigfile() {
         .collect();
     for run in archives[1].hash_runs() {
         let hash = run[0].name_hash;
-        let expected = archives[1].find_with_sku_mask(hash, 0);
+        let expected = archives[1].find_with_spec_mask(hash, 0);
         let resolved = set.resolve(hash, 0).unwrap();
         if !patched.contains(&hash) {
             assert_eq!(resolved.archive.stem(), "bigfile");

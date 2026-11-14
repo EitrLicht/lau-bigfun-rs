@@ -3,12 +3,12 @@
 //! Modules:
 //! - [`format`](mod@format) — Sector (`2048` B), block (`1 MiB`), and logical volume geometry.
 //! - [`hash`] — Case-insensitive ASCII `tolower` + MSB-first `CRC-32/BZIP2` path hashing.
-//! - [`fat`] — File Allocation Table (`Entry`, `Fat`) parsing, validation, and SKU-aware lookup.
+//! - [`fat`] — File Allocation Table (`Entry`, `Fat`) parsing, validation, and specialisation-aware lookup.
 //! - [`archive`] — Physical part file discovery (`.000`..`.NNN` / `.dat`), segment boundary verification, whole or streamed raw/zlib entry reads, and resolution across stacked archives in a caller-chosen priority order.
 //! - [`filelist`] — Hash dictionary built from caller-supplied filelists.
 //! - [`path`] — Traversal-safe sanitization of archive paths and output path comparison.
 //! - [`filter`] — Entry filtering by case-insensitive substring, compiled glob set, or resolution status.
-//! - [`unpack`] — Single-entry and batch extraction supporting SKU masks and multi-variant disambiguation.
+//! - [`unpack`] — Single-entry and batch extraction supporting spec masks and multi-variant disambiguation.
 //!
 //! # Example
 //!
@@ -50,7 +50,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let archive = Bigfile::open("/path/to/game")?;
 //! let hash = name_hash(r"pc-w\lara.drm")?;
-//! if let Some(entry) = archive.find_with_sku_mask(hash, 0x1) {
+//! if let Some(entry) = archive.find_with_spec_mask(hash, 0x1) {
 //!     let mut header = [0u8; 16];
 //!     archive.open_entry(entry, false)?.read_exact(&mut header)?;
 //!     println!("{header:02x?}");

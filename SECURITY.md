@@ -12,4 +12,6 @@ This is a hobby project maintained on a best-effort basis: there is no bug bount
 
 ## Scope
 
-In scope: anything that lets a crafted archive or filelist make the tool write outside its output directory, run code, or exhaust memory. Crashes or errors on malformed archives are ordinary bugs; please file them as issues.
+In scope: anything that lets a crafted archive or filelist make the tool write outside its output directory, run code, or exhaust memory.
+
+Out of scope: crashes or errors on malformed archives. These are ordinary bugs; please file them as issues.

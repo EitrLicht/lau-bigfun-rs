@@ -1,4 +1,4 @@
-//! High-level archive extraction and SKU/locale variant path disambiguation.
+//! High-level archive extraction and specialisation variant path disambiguation.
 
 use std::path::Path;
 
@@ -13,19 +13,19 @@ pub use execute::extract_entry;
 use execute::{create_parent_directories, extract_items};
 use plan::{build_extraction_plan, planned_output_bytes, select_archive_entries};
 
-/// Policy for laying out files when multiple FAT records share the same `name_hash` (e.g. per-SKU
-/// or per-language variants).
+/// Policy for laying out files when multiple FAT records share the same `name_hash`: its
+/// specialisation variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VariantLayout {
     /// Place entries with a unique `name_hash` directly at `<out_dir>/<path>`, and place entries
-    /// that have multiple selected variants under `<out_dir>/sku_<sku_flags:08x>/<path>`.
+    /// that have multiple selected variants under `<out_dir>/spec_<spec_flags:08x>/<path>`.
     #[default]
-    SkuSubdirWhenAmbiguous,
+    SpecSubdirWhenAmbiguous,
 
-    /// Always place every entry under `<out_dir>/sku_<sku_flags:08x>/<path>`.
-    AlwaysSkuSubdir,
+    /// Always place every entry under `<out_dir>/spec_<spec_flags:08x>/<path>`.
+    AlwaysSpecSubdir,
 
-    /// Keep flat directory structure and append `.sku_<sku_flags:08x>` before the file extension
+    /// Keep flat directory structure and append `.spec_<spec_flags:08x>` before the file extension
     /// when multiple variants exist for the same `name_hash`.
     FilenameSuffix,
 }
@@ -33,10 +33,10 @@ pub enum VariantLayout {
 /// Configuration options for [`unpack_archive`] and [`unpack_archive_set`].
 #[derive(Debug, Clone, Default)]
 pub struct UnpackOptions {
-    /// Optional SKU bitmask filter (`(entry.sku_flags & mask) == mask`).
-    pub sku_mask: Option<u32>,
-    /// If `true` when `sku_mask` is set, selects at most one matching record per unique
-    /// `name_hash`, using the lookup order of [`Bigfile::find_with_sku_mask`] within each archive
+    /// Optional spec mask filter (`(entry.spec_flags & mask) == mask`).
+    pub spec_mask: Option<u32>,
+    /// If `true` when `spec_mask` is set, selects at most one matching record per unique
+    /// `name_hash`, using the lookup order of [`Bigfile::find_with_spec_mask`] within each archive
     /// and [`ArchiveSet::resolve`] across a set.
     pub single_match_per_hash: bool,
     /// Layout policy when multiple records with the same `name_hash` are selected for extraction.
@@ -63,12 +63,12 @@ pub struct UnpackOptions {
 }
 
 impl UnpackOptions {
-    /// The SKU mask to resolve each hash with when selecting one record per hash, or `None` when
+    /// The spec mask to resolve each hash with when selecting one record per hash, or `None` when
     /// every matching record is selected.
     #[inline]
     #[must_use]
     pub(crate) fn resolution_mask(&self) -> Option<u32> {
-        self.sku_mask.filter(|_| self.single_match_per_hash)
+        self.spec_mask.filter(|_| self.single_match_per_hash)
     }
 
     /// Checks `planned` output bytes against [`max_output_bytes`](Self::max_output_bytes).
@@ -97,7 +97,7 @@ pub struct UnpackReport {
     pub resolved_entries: usize,
     /// Number of extracted entries that fell back to `__unknown/<hash>.bin`.
     pub unknown_entries: usize,
-    /// Number of TOC records not extracted, because they failed `sku_mask` or `filter` or another
+    /// Number of TOC records not extracted, because they failed `spec_mask` or `filter` or another
     /// record was selected for their hash.
     pub skipped_entries: usize,
     /// Number of extracted entries taken from an archive ahead of the last one in the set, such as a
@@ -137,8 +137,8 @@ pub fn unpack_archive(
 ///
 /// # Errors
 ///
-/// Fails like [`unpack_archive`], and with [`BigfileError::ResolutionRequiresSkuMatch`] when `set`
-/// holds several archives but `options` lacks `sku_mask` or `single_match_per_hash`, which
+/// Fails like [`unpack_archive`], and with [`BigfileError::ResolutionRequiresSpecMatch`] when `set`
+/// holds several archives but `options` lacks `spec_mask` or `single_match_per_hash`, which
 /// resolving a name across archives needs.
 pub fn unpack_archive_set(
     set: ArchiveSet<'_>,
@@ -148,7 +148,7 @@ pub fn unpack_archive_set(
 ) -> Result<UnpackReport, BigfileError> {
     let archives = set.archives();
     if archives.len() > 1 && options.resolution_mask().is_none() {
-        return Err(BigfileError::ResolutionRequiresSkuMatch);
+        return Err(BigfileError::ResolutionRequiresSpecMatch);
     }
     let selection = select_archive_entries(set, dict, options);
     let plan = build_extraction_plan(&selection, out_dir, options.variant_layout);
@@ -187,16 +187,24 @@ mod tests {
         write_shared_sector_archive, zlib_compress,
     };
 
+    /// Inflated payload of the multi-variant archive's compressed `pc-w\alpha.drm` record.
+    const ALPHA_INFLATED: &[u8] = b"alpha_spec1_inflated_payload_bytes";
+
     fn create_multi_variant_test_archive(tmp: &TempDir) -> (Bigfile, HashDictionary, Vec<u8>) {
         let mut dict = HashDictionary::new();
         dict.load_str("pc-w\\alpha.drm\npc-w\\beta.drm\npc-w\\gamma.drm\npc-w\\delta.drm")
             .unwrap();
-        let alpha_z = zlib_compress(b"alpha_sku1_inflated_payload_bytes");
+        let alpha_z = zlib_compress(ALPHA_INFLATED);
 
         let h = |s| name_hash(s).unwrap();
         let mut records = vec![
-            ArchiveRecord::zlib(h(r"pc-w\alpha.drm"), 1, &alpha_z, 33),
-            ArchiveRecord::stored(h(r"pc-w\alpha.drm"), 3, b"alpha_sku3_raw"),
+            ArchiveRecord::zlib(
+                h(r"pc-w\alpha.drm"),
+                1,
+                &alpha_z,
+                ALPHA_INFLATED.len() as u32,
+            ),
+            ArchiveRecord::stored(h(r"pc-w\alpha.drm"), 3, b"alpha_spec3_raw"),
             ArchiveRecord::stored(h(r"pc-w\beta.drm"), 1, b"beta_payload"),
             ArchiveRecord::stored(h(r"pc-w\gamma.drm"), 2, b"gamma_payload"),
             ArchiveRecord::stored(h(r"pc-w\delta.drm"), 1, b"delta_payload"),
@@ -229,12 +237,12 @@ mod tests {
         assert_eq!(report.unknown_entries, 1);
         assert_eq!(report.skipped_entries, 0);
         assert_eq!(
-            fs::read(out_parallel.join("sku_00000001/pc-w/alpha.drm")).unwrap(),
-            b"alpha_sku1_inflated_payload_bytes"
+            fs::read(out_parallel.join("spec_00000001/pc-w/alpha.drm")).unwrap(),
+            ALPHA_INFLATED
         );
         assert_eq!(
-            fs::read(out_parallel.join("sku_00000003/pc-w/alpha.drm")).unwrap(),
-            b"alpha_sku3_raw"
+            fs::read(out_parallel.join("spec_00000003/pc-w/alpha.drm")).unwrap(),
+            b"alpha_spec3_raw"
         );
         assert_eq!(
             fs::read(out_parallel.join("__unknown/deadbeef.bin")).unwrap(),
@@ -320,8 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn always_sku_subdir_places_unique_hash_under_its_sku() {
-        let tmp = TempDir::new("always_sku");
+    fn always_spec_subdir_places_unique_hash_under_its_spec_folder() {
+        let tmp = TempDir::new("always_spec");
         let path = tmp.join("bigfile.000");
         let hash = name_hash(r"pc-w\lara.drm").unwrap();
         write_archive(
@@ -332,14 +340,14 @@ mod tests {
         let mut dict = HashDictionary::new();
         dict.load_str(r"pc-w\lara.drm").unwrap();
         let options = UnpackOptions {
-            variant_layout: VariantLayout::AlwaysSkuSubdir,
+            variant_layout: VariantLayout::AlwaysSpecSubdir,
             ..UnpackOptions::default()
         };
         let out = tmp.join("out");
 
         unpack_archive(&Bigfile::open(&path).unwrap(), &dict, &out, &options).unwrap();
 
-        let expected = out.join("sku_00000007/pc-w/lara.drm");
+        let expected = out.join("spec_00000007/pc-w/lara.drm");
         assert_eq!(fs::read(expected).unwrap(), b"lara");
     }
 
@@ -383,16 +391,16 @@ mod tests {
 
     #[test]
     fn unpack_archive_honors_single_match_per_hash() {
-        let tmp = TempDir::new("engine_sku");
+        let tmp = TempDir::new("engine_spec");
         let (bf, dict, _) = create_multi_variant_test_archive(&tmp);
 
-        let out_dir = tmp.join("out_engine_sku");
+        let out_dir = tmp.join("out_engine_spec");
         let report = unpack_archive(
             &bf,
             &dict,
             &out_dir,
             &UnpackOptions {
-                sku_mask: Some(0x0000_0001),
+                spec_mask: Some(0x0000_0001),
                 single_match_per_hash: true,
                 variant_layout: VariantLayout::FilenameSuffix,
                 raw: false,
@@ -407,7 +415,7 @@ mod tests {
         assert_eq!(report.skipped_entries, 5);
         assert_eq!(
             fs::read(out_dir.join("pc-w/alpha.drm")).unwrap(),
-            b"alpha_sku3_raw"
+            b"alpha_spec3_raw"
         );
     }
 
@@ -425,7 +433,7 @@ mod tests {
             ..UnpackOptions::default()
         };
         unpack_archive(&bf, &dict, &out_dir, &options).unwrap();
-        let stored = fs::read(out_dir.join("pc-w/alpha.sku_00000001.drm")).unwrap();
+        let stored = fs::read(out_dir.join("pc-w/alpha.spec_00000001.drm")).unwrap();
         assert_eq!(stored, alpha_z);
     }
 
@@ -444,7 +452,7 @@ mod tests {
 
     fn resolving_options(jobs: usize) -> UnpackOptions {
         UnpackOptions {
-            sku_mask: Some(1),
+            spec_mask: Some(1),
             single_match_per_hash: true,
             jobs,
             ..UnpackOptions::default()
@@ -488,13 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn unpack_archive_set_requires_sku_match_across_archives() {
+    fn unpack_archive_set_requires_spec_match_across_archives() {
         let tmp = TempDir::new("set_mask");
         let archives = create_patched_pair(&tmp);
         let set = ArchiveSet::new(&archives);
         let dict = HashDictionary::new();
         let err = unpack_archive_set(set, &dict, &tmp, &UnpackOptions::default());
-        assert!(matches!(err, Err(BigfileError::ResolutionRequiresSkuMatch)));
+        assert!(matches!(
+            err,
+            Err(BigfileError::ResolutionRequiresSpecMatch)
+        ));
     }
 
     #[test]

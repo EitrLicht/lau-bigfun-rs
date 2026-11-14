@@ -31,7 +31,7 @@ mod unpack;
 const SYNTHETIC_PAYLOAD: &[u8] = b"synthetic lara payload";
 
 /// Writes the synthetic archive to `path` in `endian` byte order: one `pc-w\lara.drm` record for
-/// SKU `0x1` holding [`SYNTHETIC_PAYLOAD`].
+/// spec flags `0x1` holding [`SYNTHETIC_PAYLOAD`].
 fn write_synthetic_archive(path: &Path, endian: Endian) {
     let hash = name_hash(r"pc-w\lara.drm").unwrap();
     let record = ArchiveRecord::stored(hash, 0x0000_0001, SYNTHETIC_PAYLOAD);

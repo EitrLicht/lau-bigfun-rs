@@ -121,7 +121,7 @@ fn unpack_json_emits_extraction_report() {
     assert_eq!(
         val,
         serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "output": out_str,
             "extracted_files": 1,
             "extracted_bytes": 22,
