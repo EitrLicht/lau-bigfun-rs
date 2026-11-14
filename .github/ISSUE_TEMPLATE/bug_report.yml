@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a crash, wrong output or error message.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This tool is feature complete, so feature requests and support for other games are out of scope. Please don't attach game files or extracted content.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `lau-bigfun --version`.
+      placeholder: lau-bigfun 0.2.1
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - "Tomb Raider: Legend"
+        - "Tomb Raider: Anniversary"
+        - "Tomb Raider: Underworld"
+        - "Lara Croft and the Guardian of Light"
+        - Not game-specific
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Platform and release
+      description: Where the archive comes from, for example PC (Steam), PC (GOG) or PS3 (Europe).
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran, including any `--filelist`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Everything the command printed, including any error.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen instead, if it isn't obvious.

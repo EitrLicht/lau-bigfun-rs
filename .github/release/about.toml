@@ -1,0 +1,5 @@
+# cargo-about configuration for the THIRD-PARTY-LICENSES.txt shipped with release builds.
+# Licences are preferred in this order when a crate offers a choice.
+accepted = ["MIT", "Apache-2.0", "Zlib", "Unlicense", "0BSD", "Unicode-3.0"]
+targets = ["x86_64-pc-windows-msvc"]
+ignore-dev-dependencies = true

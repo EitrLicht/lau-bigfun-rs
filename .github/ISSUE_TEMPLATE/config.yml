@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Scope & Status
+    url: https://github.com/EitrLicht/lau-bigfun-rs#scope--status
+    about: Feature requests and support for other games are out of scope.

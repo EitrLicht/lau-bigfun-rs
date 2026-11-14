@@ -1,0 +1,49 @@
+[package]
+name = "lau-bigfun-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+lau-bigfun = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[workspace]
+
+[[bin]]
+name = "fat_parse"
+path = "fuzz_targets/fat_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_read"
+path = "fuzz_targets/archive_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filelist_load"
+path = "fuzz_targets/filelist_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sanitize_path"
+path = "fuzz_targets/sanitize_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_filter"
+path = "fuzz_targets/glob_filter.rs"
+test = false
+doc = false
+bench = false

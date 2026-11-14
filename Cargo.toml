@@ -1,0 +1,41 @@
+[package]
+name = "lau-bigfun"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.88"
+description = "Tomb Raider LAU (Legend, Anniversary, Underworld) bigfile archive reader and unpacker"
+license = "MIT"
+repository = "https://github.com/EitrLicht/lau-bigfun-rs"
+exclude = ["/fuzz"]
+
+[lib]
+name = "lau_bigfun"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lau-bigfun"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
+globset = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+crc32fast = "1.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+must_use_candidate = "warn"
+missing_errors_doc = "warn"

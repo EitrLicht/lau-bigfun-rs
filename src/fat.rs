@@ -1,0 +1,840 @@
+//! TRLAU File Allocation Table (FAT) structures, deserialization, and lookup.
+
+use std::cmp::Ordering;
+use std::io::{self, Read};
+
+use thiserror::Error;
+
+use crate::format::{
+    Endian, FAT_COUNT_BYTES, FAT_HASH_BYTES, HexLabel, RECORD_STRIDE, fat_byte_len,
+    sector_logical_offset,
+};
+
+/// Errors that can occur when parsing or validating a bigfile FAT.
+///
+/// Each variant except [`Io`](Self::Io) names the byte order the FAT was read in, since byte-order
+/// detection tries both.
+#[derive(Debug, Error)]
+pub enum FatError {
+    /// Reading the FAT failed.
+    #[error("I/O error while reading FAT: {0}")]
+    Io(#[from] io::Error),
+
+    /// The input ends before the hashes and records its entry count declares.
+    #[error(
+        "bigfile FAT truncated ({endian}): expected {expected} bytes for {count} entries, got {actual}"
+    )]
+    Truncated {
+        /// Byte order the FAT was read in.
+        endian: Endian,
+        /// Entry count read from the FAT header.
+        count: u32,
+        /// Bytes the hashes and records need after the 4-byte count, or `usize::MAX` when that
+        /// size overflows.
+        expected: usize,
+        /// Bytes available for them.
+        actual: usize,
+    },
+
+    /// A name hash is lower than the one before it, so the table is not sorted by hash.
+    #[error(
+        "FAT hashes ({endian}) are not sorted in non-decreasing order at index {index}: {} > {}", HexLabel::new(*.prev), HexLabel::new(*.curr)
+    )]
+    UnsortedHashes {
+        /// Byte order the FAT was read in.
+        endian: Endian,
+        /// Position of the out-of-order record.
+        index: usize,
+        /// Hash of the record before it.
+        prev: u32,
+        /// Hash of the out-of-order record.
+        curr: u32,
+    },
+
+    /// A record's `deflated_size` is negative.
+    #[error(
+        "FAT record {index} (hash {}, {endian}) has negative deflated_size {deflated_size}", HexLabel::new(*.name_hash)
+    )]
+    NegativeDeflatedSize {
+        /// Byte order the FAT was read in.
+        endian: Endian,
+        /// Position of the record in the FAT.
+        index: usize,
+        /// Path hash of the record.
+        name_hash: u32,
+        /// The negative value read.
+        deflated_size: i32,
+    },
+}
+
+/// Metadata describing a single file record in the bigfile FAT.
+///
+/// On-disk layout in `bigfile.000` (`@0x04 + 4*count + 16*index`, in archive endianness):
+/// - `+0x00`: `u32 size` (uncompressed byte size)
+/// - `+0x04`: `u32 sector_number` (logical start sector; byte offset = `sector_number * 2048`)
+/// - `+0x08`: `u32 sku_flags` (SKU / language / platform bitmask)
+/// - `+0x0C`: `i32 deflated_size` (compressed size; `0` => stored uncompressed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry {
+    /// Zero-based index of this record in the FAT.
+    pub index: usize,
+    /// 32-bit `CRC-32/BZIP2` hash of the lowercased asset path.
+    pub name_hash: u32,
+    /// Uncompressed size in bytes.
+    pub size: u32,
+    /// Starting sector index in the logical archive address space.
+    pub sector_number: u32,
+    /// SKU, language, and platform bitmask.
+    pub sku_flags: u32,
+    /// Compressed size in bytes (`0` means stored uncompressed).
+    pub deflated_size: i32,
+}
+
+impl Entry {
+    /// Physical byte count stored on disk (`deflated_size` if compressed, otherwise `size`).
+    #[inline]
+    #[must_use]
+    pub const fn stored_size(&self) -> u32 {
+        if self.is_compressed() {
+            self.deflated_size.cast_unsigned()
+        } else {
+            self.size
+        }
+    }
+
+    /// Byte offset of the entry in the concatenated logical archive (`sector_number * 2048`).
+    #[inline]
+    #[must_use]
+    pub const fn logical_offset(&self) -> u64 {
+        sector_logical_offset(self.sector_number)
+    }
+
+    /// Returns `true` if this entry is stored zlib-compressed (`deflated_size > 0`).
+    #[inline]
+    #[must_use]
+    pub const fn is_compressed(&self) -> bool {
+        self.deflated_size > 0
+    }
+
+    /// Returns `true` if reading this entry inflates it: it is compressed and `raw` is `false`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_inflated_on_read(&self, raw: bool) -> bool {
+        !raw && self.is_compressed()
+    }
+
+    /// Bytes a read of this entry yields: its inflated `size` when
+    /// [`is_inflated_on_read`](Self::is_inflated_on_read), otherwise its stored bytes.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn read_len(&self, raw: bool) -> u32 {
+        if self.is_inflated_on_read(raw) {
+            self.size
+        } else {
+            self.stored_size()
+        }
+    }
+
+    /// Tests whether this entry satisfies `sku_mask` using the engine's bitwise rule
+    /// `(entry.sku_flags & sku_mask) == sku_mask`.
+    #[inline]
+    #[must_use]
+    pub const fn matches_sku_mask(&self, sku_mask: u32) -> bool {
+        (self.sku_flags & sku_mask) == sku_mask
+    }
+}
+
+/// Tomb Raider LAU File Allocation Table.
+#[derive(Debug, Clone)]
+pub struct Fat {
+    entries: Vec<Entry>,
+    endian: Endian,
+}
+
+/// Most bytes (8 MiB) reserved up front for a buffer whose final length comes from an untrusted
+/// header, such as a FAT's entry count or an entry's inflated size, so a corrupt value fails
+/// once the data runs out instead of exhausting memory.
+pub(crate) const MAX_UNTRUSTED_RESERVATION: usize = 8 * 1024 * 1024;
+
+// A record is four 32-bit words, which `Fat::decode_entry` reads one by one.
+const _: () = assert!(RECORD_STRIDE == 4 * 4);
+
+/// Byte layout of a FAT body (`count` hashes, then `count` records) under one byte order.
+#[derive(Debug, Clone, Copy)]
+struct TableLayout {
+    endian: Endian,
+    count: u32,
+    /// Bytes of the hash array, which the record array follows.
+    hashes_len: usize,
+    /// Bytes of the whole body after the 4-byte entry count.
+    body_len: usize,
+}
+
+impl TableLayout {
+    /// Reads the entry count from `header` in `endian` order and sizes the body, failing if its
+    /// size overflows `usize`.
+    fn new(header: [u8; 4], endian: Endian) -> Result<Self, FatError> {
+        let count = endian.read_u32(header);
+        let hashes_len = (count as usize).checked_mul(FAT_HASH_BYTES);
+        let fat_len = fat_byte_len(count as usize);
+        let (Some(hashes_len), Some(fat_len)) = (hashes_len, fat_len) else {
+            return Err(FatError::Truncated {
+                endian,
+                count,
+                expected: usize::MAX,
+                actual: 0,
+            });
+        };
+        Ok(Self {
+            endian,
+            count,
+            hashes_len,
+            body_len: fat_len - FAT_COUNT_BYTES,
+        })
+    }
+
+    /// Error for a body of which only `actual` bytes are available.
+    const fn truncated(&self, actual: usize) -> FatError {
+        FatError::Truncated {
+            endian: self.endian,
+            count: self.count,
+            expected: self.body_len,
+            actual,
+        }
+    }
+
+    /// Fails before reading if a file of `max_file_bytes` cannot hold the count and the body.
+    fn check_fits(&self, max_file_bytes: Option<u64>) -> Result<(), FatError> {
+        let Some(max_bytes) = max_file_bytes else {
+            return Ok(());
+        };
+        let available = max_bytes.saturating_sub(FAT_COUNT_BYTES as u64);
+        if self.body_len as u64 > available {
+            return Err(self.truncated(usize::try_from(available).unwrap_or(usize::MAX)));
+        }
+        Ok(())
+    }
+
+    /// Reads the rest of the body into `buf`, which may already hold its start from an earlier
+    /// byte-order candidate, and returns the body. The first reservation is capped so a corrupt
+    /// count fails with [`FatError::Truncated`] instead of exhausting memory.
+    fn read_body<'b, R: Read>(
+        &self,
+        reader: &mut R,
+        buf: &'b mut Vec<u8>,
+    ) -> Result<&'b [u8], FatError> {
+        let needed = self.body_len.saturating_sub(buf.len());
+        if needed > 0 {
+            buf.reserve(needed.min(MAX_UNTRUSTED_RESERVATION));
+            reader.take(needed as u64).read_to_end(buf)?;
+        }
+        let len = buf.len();
+        buf.get(..self.body_len).ok_or_else(|| self.truncated(len))
+    }
+}
+
+impl Fat {
+    /// Parses and validates the FAT from the start of a `bigfile.000` / `BIGFILE.DAT` stream,
+    /// automatically detecting TOC byte order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::parse_bounded`].
+    pub fn parse<R: Read>(reader: &mut R) -> Result<Self, FatError> {
+        Self::parse_bounded(reader, None, None)
+    }
+
+    /// Parses and validates the FAT, optionally checking against the known physical byte size
+    /// of `bigfile.000` (`max_file_bytes`) and using `endian_override` (or auto-detecting byte
+    /// order when `None`).
+    ///
+    /// # Errors
+    ///
+    /// - [`FatError::Io`] when reading fails.
+    /// - [`FatError::Truncated`] when the input, or `max_file_bytes`, is too short for the entry
+    ///   count.
+    /// - [`FatError::UnsortedHashes`] or [`FatError::NegativeDeflatedSize`] when a record is
+    ///   invalid.
+    ///
+    /// When auto-detecting and both byte orders fail, the error is from the order that reads the
+    /// smaller entry count, which is tried first.
+    pub fn parse_bounded<R: Read>(
+        reader: &mut R,
+        max_file_bytes: Option<u64>,
+        endian_override: Option<Endian>,
+    ) -> Result<Self, FatError> {
+        let header = Self::read_header(reader)?;
+        let mut buf = Vec::new();
+        match endian_override {
+            Some(endian) => Self::try_candidate(reader, &mut buf, header, max_file_bytes, endian),
+            None => Self::parse_auto_endian(reader, &mut buf, header, max_file_bytes),
+        }
+    }
+
+    /// Reads the 4-byte entry count that starts the FAT, still in its stored byte order.
+    pub(crate) fn read_header<R: Read>(reader: &mut R) -> Result<[u8; 4], FatError> {
+        let mut header = [0u8; 4];
+        reader.read_exact(&mut header)?;
+        Ok(header)
+    }
+
+    /// The byte orders to try when detecting the FAT's, in order: the one that reads `header` as
+    /// the smaller entry count first (`Little` on ties), then the other.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn auto_endian_order(header: [u8; 4]) -> [Endian; 2] {
+        if Endian::Big.read_u32(header) < Endian::Little.read_u32(header) {
+            [Endian::Big, Endian::Little]
+        } else {
+            [Endian::Little, Endian::Big]
+        }
+    }
+
+    /// Tries `attempt` with the preferred byte order for `header`, then with the other one if that
+    /// fails, threading `state` (such as the reader and buffer an attempt reads with) through both.
+    /// Returns the first success with the other byte order still untried, if any, or both errors.
+    pub(crate) fn try_auto_endian<S, T, E>(
+        header: [u8; 4],
+        state: S,
+        mut attempt: impl FnMut(S, Endian) -> Result<T, (S, E)>,
+    ) -> Result<(T, Option<Endian>), (E, E)> {
+        let [preferred, other] = Self::auto_endian_order(header);
+        match attempt(state, preferred) {
+            Ok(found) => Ok((found, Some(other))),
+            Err((state, first_err)) => match attempt(state, other) {
+                Ok(found) => Ok((found, None)),
+                Err((_, second_err)) => Err((first_err, second_err)),
+            },
+        }
+    }
+
+    /// Auto-detects FAT byte order from the FAT alone through [`Self::try_auto_endian`], keeping
+    /// the first order whose size and entries are valid and otherwise reporting the preferred
+    /// order's error. [`Bigfile`](crate::archive::Bigfile) runs the same loop with the volume
+    /// layout checked under each order as well.
+    fn parse_auto_endian<R: Read>(
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        header: [u8; 4],
+        max_file_bytes: Option<u64>,
+    ) -> Result<Self, FatError> {
+        Self::try_auto_endian(header, (), |(), endian| {
+            Self::try_candidate(reader, buf, header, max_file_bytes, endian)
+                .map_err(|err| ((), err))
+        })
+        .map(|(fat, _)| fat)
+        .map_err(|(primary_err, _)| primary_err)
+    }
+
+    /// Parses the FAT body in `endian` byte order: checks that it fits in `max_file_bytes`, reads
+    /// what `buf` does not already hold, then decodes and validates the entries. `reader` must be
+    /// positioned just past the header and whatever `buf` already holds, so attempts in different
+    /// byte orders can share one buffer.
+    pub(crate) fn try_candidate<R: Read>(
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        header: [u8; 4],
+        max_file_bytes: Option<u64>,
+        endian: Endian,
+    ) -> Result<Self, FatError> {
+        let layout = TableLayout::new(header, endian)?;
+        layout.check_fits(max_file_bytes)?;
+        let body = layout.read_body(reader, buf)?;
+        let (hashes, records) = body.split_at(layout.hashes_len);
+        let entries = Self::decode_entries(hashes, records, endian);
+        Self::validate_entries(&entries, endian)?;
+        Ok(Self { entries, endian })
+    }
+
+    /// Decodes a single [`Entry`] from its hash and its record's four 32-bit words in `endian`
+    /// order.
+    #[inline]
+    const fn decode_entry(
+        index: usize,
+        hash: [u8; 4],
+        record: [[u8; 4]; 4],
+        endian: Endian,
+    ) -> Entry {
+        let [size, sector_number, sku_flags, deflated_size] = record;
+        Entry {
+            index,
+            name_hash: endian.read_u32(hash),
+            size: endian.read_u32(size),
+            sector_number: endian.read_u32(sector_number),
+            sku_flags: endian.read_u32(sku_flags),
+            deflated_size: endian.read_i32(deflated_size),
+        }
+    }
+
+    /// Decodes the entries from parallel hash and record byte slices in `endian` order.
+    fn decode_entries(hashes: &[u8], records: &[u8], endian: Endian) -> Vec<Entry> {
+        let (hashes, _) = hashes.as_chunks::<FAT_HASH_BYTES>();
+        let (records, _) = records.as_chunks::<4>().0.as_chunks::<4>();
+        std::iter::zip(hashes, records)
+            .enumerate()
+            .map(|(index, (&hash, &record))| Self::decode_entry(index, hash, record, endian))
+            .collect()
+    }
+
+    /// Validates invariants for a single entry (`deflated_size >= 0` and sorted `name_hash`).
+    #[inline]
+    fn validate_entry(
+        index: usize,
+        prev_hash: Option<u32>,
+        entry: &Entry,
+        endian: Endian,
+    ) -> Result<(), FatError> {
+        if entry.deflated_size < 0 {
+            return Err(FatError::NegativeDeflatedSize {
+                endian,
+                index,
+                name_hash: entry.name_hash,
+                deflated_size: entry.deflated_size,
+            });
+        }
+        if let Some(prev) = prev_hash
+            && prev > entry.name_hash
+        {
+            return Err(FatError::UnsortedHashes {
+                endian,
+                index,
+                prev,
+                curr: entry.name_hash,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates all entries in the table.
+    fn validate_entries(entries: &[Entry], endian: Endian) -> Result<(), FatError> {
+        let mut prev_hash = None;
+        for (i, entry) in entries.iter().enumerate() {
+            Self::validate_entry(i, prev_hash, entry, endian)?;
+            prev_hash = Some(entry.name_hash);
+        }
+        Ok(())
+    }
+
+    /// Returns the detected or configured byte order of this FAT.
+    #[inline]
+    #[must_use]
+    pub const fn endian(&self) -> Endian {
+        self.endian
+    }
+
+    /// Returns the total number of records in the FAT.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if the FAT contains zero records.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the slice of all entries in TOC order.
+    #[inline]
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Returns an iterator yielding contiguous slices of entries sharing the same `name_hash`.
+    #[inline]
+    pub fn hash_runs(&self) -> impl Iterator<Item = &[Entry]> {
+        self.entries.chunk_by(|a, b| a.name_hash == b.name_hash)
+    }
+
+    /// Returns the total byte size of the on-disk FAT header (`4 + 20 * count`).
+    #[inline]
+    #[must_use]
+    pub fn header_byte_size(&self) -> usize {
+        fat_byte_len(self.entries.len()).unwrap_or(usize::MAX)
+    }
+
+    /// Returns all entries matching `target_hash` in TOC order ($O(\log N)$ binary search).
+    ///
+    /// Because `hashes` are sorted non-decreasing, all locale/SKU variants for a given path hash
+    /// occupy a contiguous slice.
+    #[must_use]
+    pub fn find_all(&self, target_hash: u32) -> &[Entry] {
+        let start = self.entries.partition_point(|e| e.name_hash < target_hash);
+        let end = self.entries[start..].partition_point(|e| e.name_hash == target_hash) + start;
+        &self.entries[start..end]
+    }
+
+    /// Returns an iterator over `entries` whose `sku_flags` satisfy `sku_mask`
+    /// (or all `entries` when `sku_mask` is `None`).
+    #[inline]
+    pub fn filter_sku_mask(
+        entries: &[Entry],
+        sku_mask: Option<u32>,
+    ) -> impl Iterator<Item = &Entry> {
+        entries
+            .iter()
+            .filter(move |e| sku_mask.is_none_or(|mask| e.matches_sku_mask(mask)))
+    }
+
+    /// Returns an iterator over all entries matching `target_hash` whose `sku_flags` satisfy `sku_mask`
+    /// (`(entry.sku_flags & sku_mask) == sku_mask`).
+    #[inline]
+    pub fn find_all_with_sku_mask(
+        &self,
+        target_hash: u32,
+        sku_mask: u32,
+    ) -> impl Iterator<Item = &Entry> {
+        Self::filter_sku_mask(self.find_all(target_hash), Some(sku_mask))
+    }
+
+    /// Finds the entry selected by the game engine's lookup order for `target_hash` and `sku_mask`,
+    /// where `sku_flags` must satisfy `(entry.sku_flags & sku_mask) == sku_mask`.
+    ///
+    /// That order tries the record a binary search lands on, then walks down through the rest of
+    /// the hash's run, then up. The landing record depends only on `target_hash` and the table, so
+    /// this can differ from the first matching record when several records of a run match.
+    ///
+    /// This covers one archive only. When a game stacks several archives, such as a patch over its
+    /// base, the record it loads can come from another archive; [`ArchiveSet`](crate::ArchiveSet)
+    /// resolves a name across them.
+    #[must_use]
+    pub fn find_with_sku_mask(&self, target_hash: u32, sku_mask: u32) -> Option<&Entry> {
+        let landing = self.engine_landing_index(target_hash)?;
+        let (below, from_landing) = self.entries.split_at(landing);
+        let (landing_entry, above) = from_landing.split_first()?;
+        let same_hash = |entry: &&Entry| entry.name_hash == target_hash;
+        std::iter::once(landing_entry)
+            .chain(below.iter().rev().take_while(same_hash))
+            .chain(above.iter().take_while(same_hash))
+            .find(|entry| entry.matches_sku_mask(sku_mask))
+    }
+
+    /// Returns the index the engine's binary search lands on for `target_hash`, tracking the
+    /// remaining span above and below the midpoint separately as it does.
+    #[must_use]
+    fn engine_landing_index(&self, target_hash: u32) -> Option<usize> {
+        let count = self.entries.len();
+        let mut mid = count / 2;
+        let (mut span_up, mut span_down) = (count - mid, mid + 1);
+        loop {
+            match target_hash.cmp(&self.entries.get(mid)?.name_hash) {
+                Ordering::Equal => return Some(mid),
+                Ordering::Greater if span_up < 2 => return None,
+                Ordering::Less if span_down < 2 => return None,
+                Ordering::Greater => {
+                    let step = span_up / 2;
+                    mid += step;
+                    span_down = step;
+                    span_up -= step;
+                }
+                Ordering::Less => {
+                    let step = span_down / 2;
+                    mid = mid.checked_sub(step)?;
+                    span_up = step;
+                    span_down -= step;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::test_support::build_fat_bytes;
+
+    /// Parses a FAT from `(name_hash, sku_flags)` pairs, with each record's size set to its index.
+    fn fat_from_hash_flags(records: &[(u32, u32)]) -> Fat {
+        let records: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(index, &(hash, flags))| (hash, index as u32, 1, flags, 0))
+            .collect();
+        Fat::parse(&mut Cursor::new(build_fat_bytes(Endian::Little, &records))).unwrap()
+    }
+
+    fn found_index(fat: &Fat, hash: u32, mask: u32) -> Option<usize> {
+        fat.find_with_sku_mask(hash, mask).map(|entry| entry.index)
+    }
+
+    const LOOKUP_HASH: u32 = 0x2000;
+
+    #[test]
+    fn find_with_sku_mask_starts_at_landing_record() {
+        let records =
+            [10, LOOKUP_HASH, LOOKUP_HASH, LOOKUP_HASH, 0xFFFF_FFF0].map(|hash| (hash, 1));
+        assert_eq!(
+            found_index(&fat_from_hash_flags(&records), LOOKUP_HASH, 1),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn find_with_sku_mask_prefers_record_below_failing_landing() {
+        let flags = [
+            (10, 1),
+            (LOOKUP_HASH, 1),
+            (LOOKUP_HASH, 0),
+            (LOOKUP_HASH, 1),
+            (0xFFFF_FFF0, 1),
+        ];
+        assert_eq!(
+            found_index(&fat_from_hash_flags(&flags), LOOKUP_HASH, 1),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_with_sku_mask_walks_up_after_exhausting_records_below() {
+        let flags = [
+            (10, 1),
+            (LOOKUP_HASH, 0),
+            (LOOKUP_HASH, 0),
+            (LOOKUP_HASH, 1),
+            (0xFFFF_FFF0, 1),
+        ];
+        assert_eq!(
+            found_index(&fat_from_hash_flags(&flags), LOOKUP_HASH, 1),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn find_with_sku_mask_stops_at_run_boundaries() {
+        let flags = [(0x1000, 1), (LOOKUP_HASH, 0), (LOOKUP_HASH, 0), (0x3000, 1)];
+        assert_eq!(
+            found_index(&fat_from_hash_flags(&flags), LOOKUP_HASH, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn find_with_sku_mask_rejects_absent_hash_in_empty_table() {
+        assert_eq!(found_index(&fat_from_hash_flags(&[]), LOOKUP_HASH, 0), None);
+    }
+
+    fn assert_every_hash_found(records: &[(u32, u32)]) {
+        let fat = fat_from_hash_flags(records);
+        let all_found = records
+            .iter()
+            .all(|&(hash, _)| fat.engine_landing_index(hash).is_some());
+        assert!(all_found, "{} records", records.len());
+    }
+
+    #[test]
+    fn engine_search_lands_on_every_hash_for_all_run_layouts() {
+        for count in 1..=12u32 {
+            for layout in 0..1u32 << (count - 1) {
+                let starts_run = |i: u32| i == 0 || (layout >> (i - 1)) & 1 == 0;
+                let records: Vec<_> = (0..count)
+                    .scan(0, |hash, i| {
+                        *hash += u32::from(starts_run(i));
+                        Some((*hash, 0))
+                    })
+                    .collect();
+                assert_every_hash_found(&records);
+            }
+        }
+    }
+
+    #[test]
+    fn engine_search_lands_on_every_hash_in_large_table() {
+        let records: Vec<_> = (0..20_000).map(|hash| (hash, 0)).collect();
+        assert_every_hash_found(&records);
+    }
+
+    #[test]
+    fn parses_valid_fat_records() {
+        let bytes = build_fat_bytes(
+            Endian::Little,
+            &[
+                (0x1000, 100, 1, 0xFFFF_F7E1, 0),
+                (0x2000, 200, 2, 0xFFFF_F7E1, 0),
+                (0x2000, 250, 3, 0xFFFF_F7E2, 120),
+                (0x3000, 300, 4, 0xFFFF_FFFF, 0),
+            ],
+        );
+        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(fat.endian(), Endian::Little);
+        assert_eq!(fat.len(), 4);
+        assert_eq!(fat.hash_runs().count(), 3);
+
+        let v2000 = fat.find_all(0x2000);
+        assert_eq!(v2000.len(), 2);
+        assert_eq!(v2000[0].size, 200);
+        assert_eq!(v2000[0].stored_size(), 200);
+        assert!(!v2000[0].is_compressed());
+        assert_eq!(v2000[1].size, 250);
+        assert_eq!(v2000[1].stored_size(), 120);
+        assert!(v2000[1].is_compressed());
+    }
+
+    #[test]
+    fn auto_detects_big_endian_fat_records() {
+        let bytes = build_fat_bytes(
+            Endian::Big,
+            &[
+                (0x1000, 100, 1, 0xFFFF_F7E1, 0),
+                (0x2000, 250, 3, 0xFFFF_F7E2, 120),
+            ],
+        );
+        let fat = Fat::parse(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(fat.endian(), Endian::Big);
+        assert_eq!(fat.len(), 2);
+        assert_eq!(fat.entries()[1].size, 250);
+        assert_eq!(fat.entries()[1].deflated_size, 120);
+
+        let err = Fat::parse_bounded(
+            &mut Cursor::new(&bytes),
+            Some(bytes.len() as u64),
+            Some(Endian::Little),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FatError::Truncated {
+                count: 0x0200_0000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_larger_endian_candidate_when_smaller_hashes_unsorted() {
+        let records: Vec<_> = (0..0x0001_0000u32)
+            .map(|i| (if i == 0 { 1 } else { 0x0100 }, 16, i + 1, 1, 0))
+            .collect();
+        let bytes = build_fat_bytes(Endian::Big, &records);
+        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(fat.endian(), Endian::Big);
+        assert_eq!(fat.len(), 0x0001_0000);
+    }
+
+    #[test]
+    fn finds_sku_masked_variants() {
+        let bytes = build_fat_bytes(
+            Endian::Little,
+            &[
+                (0x2000, 100, 1, 0b0011, 0),
+                (0x2000, 200, 2, 0b0111, 0),
+                (0x2000, 250, 3, 0b0010, 0),
+            ],
+        );
+        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+
+        let sku1 = fat.find_with_sku_mask(0x2000, 0b0011).unwrap();
+        assert_eq!(sku1.size, 200);
+        let sku2 = fat.find_with_sku_mask(0x2000, 0b0100).unwrap();
+        assert_eq!(sku2.size, 200);
+        assert!(fat.find_with_sku_mask(0x2000, 0b1000).is_none());
+
+        let all_sku1: Vec<&Entry> = fat.find_all_with_sku_mask(0x2000, 0b0011).collect();
+        assert_eq!(all_sku1.len(), 2);
+        assert_eq!(all_sku1[0].size, 100);
+        assert_eq!(all_sku1[1].size, 200);
+    }
+
+    #[test]
+    fn rejects_unsorted_hashes() {
+        let bytes = build_fat_bytes(
+            Endian::Little,
+            &[(0x2000, 100, 1, 0x1, 0), (0x1000, 100, 2, 0x1, 0)],
+        );
+        let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            FatError::UnsortedHashes {
+                endian: Endian::Little,
+                index: 1,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("(little-endian)"));
+    }
+
+    #[test]
+    fn rejects_negative_deflated_size() {
+        let bytes = build_fat_bytes(Endian::Little, &[(0x1000, 100, 1, 0x1, -5)]);
+        let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            FatError::NegativeDeflatedSize {
+                endian: Endian::Little,
+                index: 0,
+                deflated_size: -5,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("little-endian)"));
+    }
+
+    #[test]
+    fn rejects_truncated_fat() {
+        let mut bytes = build_fat_bytes(Endian::Little, &[(0x1000, 100, 1, 0x1, 0)]);
+        bytes.pop();
+        let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
+        assert!(matches!(
+            err,
+            FatError::Truncated {
+                endian: Endian::Little,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("(little-endian)"));
+    }
+
+    #[test]
+    fn rejects_corrupt_huge_count_without_oom() {
+        let fake_cdrm = b"CDRM\x01\x00\x00\x00\x10\x00\x00\x00";
+        let err = Fat::parse(&mut Cursor::new(fake_cdrm)).unwrap_err();
+        assert!(matches!(
+            err,
+            FatError::Truncated {
+                count: 0x4344_524D,
+                actual: 8,
+                ..
+            }
+        ));
+
+        let err_bounded = Fat::parse_bounded(
+            &mut Cursor::new(fake_cdrm),
+            Some(fake_cdrm.len() as u64),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err_bounded,
+            FatError::Truncated {
+                count: 0x4344_524D,
+                actual: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn handles_empty_fat() {
+        let empty = Fat::parse(&mut Cursor::new(build_fat_bytes(Endian::Little, &[]))).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.endian(), Endian::Little);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.header_byte_size(), 4);
+        assert!(empty.find_all(0x5FF9_1900).is_empty());
+    }
+
+    #[test]
+    fn header_byte_size_counts_every_record() {
+        let bytes = build_fat_bytes(
+            Endian::Little,
+            &[(0x1000, 100, 1, 0b0011, 0), (0x1000, 200, 2, 0b0111, 0)],
+        );
+        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(fat.header_byte_size(), 4 + 2 * 20);
+    }
+}
