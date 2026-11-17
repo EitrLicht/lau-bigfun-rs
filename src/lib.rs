@@ -7,8 +7,16 @@
 //! - [`archive`] — Physical part file discovery (`.000`..`.NNN` / `.dat`), segment boundary verification, whole or streamed raw/zlib entry reads, and resolution across stacked archives in a caller-chosen priority order.
 //! - [`filelist`] — Hash dictionary built from caller-supplied filelists.
 //! - [`path`] — Traversal-safe sanitization of archive paths and output path comparison.
-//! - [`filter`] — Entry filtering by case-insensitive substring, compiled glob set, or resolution status.
-//! - [`unpack`] — Single-entry and batch extraction supporting spec masks and multi-variant disambiguation.
+//! - [`filter`] (feature `unpack`) — Entry filtering by case-insensitive substring, compiled glob set, or resolution status.
+//! - [`unpack`] (feature `unpack`) — Single-entry and batch extraction supporting spec masks and multi-variant disambiguation.
+//!
+//! # Features
+//!
+//! - `unpack` — the `filter` and `unpack` modules, which add the `globset` dependency.
+//! - `cli` (default) — `unpack` plus the `lau-bigfun` binary and its argument parsing and JSON
+//!   output dependencies.
+//!
+//! A library user that only reads archives can turn both off with `default-features = false`.
 //!
 //! # Example
 //!
@@ -59,21 +67,30 @@
 //! # }
 //! ```
 
+// Docs of always-built items link to `filter` and `unpack` items. The default build, which CI
+// checks with broken links denied, resolves every link; without `unpack` those links render as
+// plain text instead of failing the build.
+#![cfg_attr(not(feature = "unpack"), allow(rustdoc::broken_intra_doc_links))]
+
 pub mod archive;
 pub mod fat;
 pub mod filelist;
+#[cfg(feature = "unpack")]
 pub mod filter;
 pub mod format;
 pub mod hash;
 pub mod path;
+#[cfg(feature = "unpack")]
 pub mod unpack;
 
 pub use archive::{ArchiveSet, Bigfile, BigfileError, EntryReader, OpenOptions, ResolvedEntry};
 pub use fat::{Entry, Fat, FatError};
 pub use filelist::{FilelistError, HashDictionary};
+#[cfg(feature = "unpack")]
 pub use filter::{EntryFilter, FilterError};
 pub use format::{Endian, HexLabel};
 pub use hash::{NonLatin1CharError, name_hash, name_hash_bytes};
+#[cfg(feature = "unpack")]
 pub use unpack::{
     UnpackOptions, UnpackReport, VariantLayout, extract_entry, unpack_archive, unpack_archive_set,
 };
@@ -91,33 +108,63 @@ mod tests {
         ArchiveRecord, TempDir, build_part0_bytes, write_archive, write_part0, zlib_compress,
     };
 
-    #[test]
-    fn reads_archive_entries_end_to_end() {
-        let dir = TempDir::new("single_part");
-        let hash_a = name_hash(r"pc-w\lara.drm").unwrap();
-        let hash_b = name_hash(r"pc-w\alister.drm").unwrap();
-        let raw_b = b"uncompressed alister payload bytes 1234567890";
-        let raw_a = b"compressed lara payload that repeats repeats repeats repeats!";
-        let z_a = zlib_compress(raw_a);
+    /// Path of the compressed entry in [`write_two_entry_archive`].
+    const LARA_PATH: &str = r"pc-w\lara.drm";
+    /// Path of the stored entry in [`write_two_entry_archive`].
+    const ALISTER_PATH: &str = r"pc-w\alister.drm";
+    /// Inflated bytes of the [`LARA_PATH`] entry in [`write_two_entry_archive`].
+    const RAW_LARA: &[u8] = b"compressed lara payload that repeats repeats repeats repeats!";
+    /// Bytes of the [`ALISTER_PATH`] entry in [`write_two_entry_archive`].
+    const RAW_ALISTER: &[u8] = b"uncompressed alister payload bytes 1234567890";
 
+    /// Writes a one-part archive holding [`RAW_ALISTER`] stored and [`RAW_LARA`] zlib-compressed.
+    fn write_two_entry_archive(prefix: &str) -> TempDir {
+        let dir = TempDir::new(prefix);
+        let z_lara = zlib_compress(RAW_LARA);
         let records = [
-            ArchiveRecord::stored(hash_b, 0xFFFF_F7E1, raw_b),
-            ArchiveRecord::zlib(hash_a, 0xFFFF_FFFF, &z_a, raw_a.len() as u32),
+            ArchiveRecord::stored(name_hash(ALISTER_PATH).unwrap(), 0xFFFF_F7E1, RAW_ALISTER),
+            ArchiveRecord::zlib(
+                name_hash(LARA_PATH).unwrap(),
+                0xFFFF_FFFF,
+                &z_lara,
+                RAW_LARA.len() as u32,
+            ),
         ];
         write_archive(dir.join("bigfile.000"), Endian::Little, &records);
+        dir
+    }
+
+    #[test]
+    fn reads_archive_entries_end_to_end() {
+        let dir = write_two_entry_archive("single_part");
+        let hash_a = name_hash(LARA_PATH).unwrap();
+        let hash_b = name_hash(ALISTER_PATH).unwrap();
 
         let bf = Bigfile::open(&dir).unwrap();
         assert_eq!((bf.entries().len(), bf.segment_length()), (2, None));
-        assert_eq!(bf.read_entry(&bf.find(hash_b)[0], false).unwrap(), raw_b);
-        assert_eq!(bf.read_entry(&bf.find(hash_a)[0], true).unwrap(), z_a);
-        assert_eq!(bf.read_entry(&bf.find(hash_a)[0], false).unwrap(), raw_a);
+        assert_eq!(
+            bf.read_entry(&bf.find(hash_b)[0], false).unwrap(),
+            RAW_ALISTER
+        );
+        assert_eq!(
+            bf.read_entry(&bf.find(hash_a)[0], true).unwrap(),
+            zlib_compress(RAW_LARA)
+        );
+        assert_eq!(bf.read_entry(&bf.find(hash_a)[0], false).unwrap(), RAW_LARA);
+    }
+
+    #[cfg(feature = "unpack")]
+    #[test]
+    fn unpacks_archive_entries_end_to_end() {
+        let dir = write_two_entry_archive("single_part_unpack");
+        let bf = Bigfile::open(&dir).unwrap();
 
         let out_dir = dir.join("unpacked");
         let mut dict = HashDictionary::new();
-        dict.load_str(r"pc-w\lara.drm").unwrap();
+        dict.load_str(LARA_PATH).unwrap();
         let report = unpack_archive(&bf, &dict, &out_dir, &UnpackOptions::default()).unwrap();
         assert_eq!(report.extracted_files, 2);
-        assert_eq!(fs::read(out_dir.join("pc-w/lara.drm")).unwrap(), raw_a);
+        assert_eq!(fs::read(out_dir.join("pc-w/lara.drm")).unwrap(), RAW_LARA);
     }
 
     /// Writes a two-part archive whose part 1 starts at a one-block stride and is `part1_len` bytes.

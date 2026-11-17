@@ -8,7 +8,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-lau-bigfun = { path = ".." }
+lau-bigfun = { path = "..", default-features = false, features = ["unpack"] }
 libfuzzer-sys = "0.4"
 
 [workspace]

@@ -34,7 +34,8 @@ pub enum BigfileError {
     #[error("failed to write output: {0}")]
     Write(#[source] io::Error),
 
-    /// An output file or directory could not be created, written or moved into place.
+    /// An output file or directory could not be created, written or moved into place. Only
+    /// unpacking (feature `unpack`) returns this.
     #[error("failed to write '{path}': {source}")]
     OutputPath {
         /// The output file or directory.
@@ -45,6 +46,7 @@ pub enum BigfileError {
     },
 
     /// The planned extraction is larger than [`UnpackOptions::max_output_bytes`](crate::UnpackOptions::max_output_bytes) allows.
+    /// Only unpacking (feature `unpack`) returns this.
     #[error("planned output of {planned} bytes exceeds the limit of {limit} bytes")]
     OutputLimitExceeded {
         /// Bytes the extraction would write.
@@ -64,7 +66,8 @@ pub enum BigfileError {
     /// [`unpack_archive_set`](crate::unpack_archive_set) was given several archives without
     /// [`UnpackOptions::spec_mask`](crate::UnpackOptions::spec_mask) and
     /// [`UnpackOptions::single_match_per_hash`](crate::UnpackOptions::single_match_per_hash),
-    /// which resolving a name across archives needs.
+    /// which resolving a name across archives needs. Only unpacking (feature `unpack`) returns
+    /// this.
     #[error("resolving across archives requires a spec mask and single-match selection")]
     ResolutionRequiresSpecMatch,
 

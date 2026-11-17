@@ -49,9 +49,19 @@ cargo install --path .
 cargo build --release
 ```
 
+To use only the library, turn off the default `cli` feature so the CLI's dependencies are not built. Add `--features unpack` for the `filter` and `unpack` modules:
+
+```bash
+cargo add lau-bigfun --no-default-features
+```
+
+Before 0.4.0 the crate had no features, so `default-features = false` changed nothing. From 0.4.0 it also turns off `filter` and `unpack`: if your `Cargo.toml` already sets it and you use either module, add `features = ["unpack"]`.
+
 ## Filelists
 
-Archives store only path hashes, so asset names come from filelists you supply with `--filelist`. No filelists are bundled, and what happens without one depends on the command:
+Archives store only path hashes, so asset names come from filelists you supply with `--filelist`. No filelists are bundled; the community [Hash Database](https://cdcengine.re/hashdb/) has downloadable lists for these games, one path per line, that `--filelist` reads as they are.
+
+What happens without a filelist depends on the command:
 
 | Command | Without `--filelist` |
 | :--- | :--- |

@@ -122,6 +122,7 @@ pub(crate) const fn forward_slash(c: char) -> char {
 
 /// Returns `s` with every `\` separator turned into `/`, the string form of [`forward_slash`],
 /// borrowing `s` when it has none.
+#[cfg(feature = "unpack")]
 #[must_use]
 pub(crate) fn to_forward_slashes(s: &str) -> Cow<'_, str> {
     if s.contains('\\') {
@@ -151,6 +152,7 @@ pub fn normalized_rel_key(path: &Path) -> String {
 }
 
 /// Appends `suffix` to the file stem of `path`, before any extension.
+#[cfg(feature = "unpack")]
 pub(crate) fn append_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("entry");
@@ -173,6 +175,7 @@ pub(crate) fn append_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "unpack")]
     #[test]
     fn to_forward_slashes_applies_forward_slash_to_every_char() {
         for s in [

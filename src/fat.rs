@@ -126,6 +126,7 @@ impl Entry {
 
     /// Bytes a read of this entry yields: its inflated `size` when
     /// [`is_inflated_on_read`](Self::is_inflated_on_read), otherwise its stored bytes.
+    #[cfg(feature = "unpack")]
     #[inline]
     #[must_use]
     pub(crate) const fn read_len(&self, raw: bool) -> u32 {
