@@ -15,8 +15,8 @@ use super::extract::{
 use super::output::*;
 use super::{execute_cli, output_limit, run_hash};
 use crate::test_support::{
-    ArchiveRecord, FailingWriter, TempDir, build_ambiguous_part0, sample_entry, write_archive,
-    write_one_record_archives, write_shared_sector_archive,
+    ArchiveRecord, FailingWriter, FatRow, TempDir, build_ambiguous_part0, sample_entry,
+    write_archive, write_one_record_archives, write_shared_sector_archive,
 };
 
 mod args;

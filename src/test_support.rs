@@ -18,6 +18,17 @@ use crate::format::{
     BLOCK_SECTOR_COUNT, Endian, SECTOR_BYTE_COUNT, fat_byte_len, sector_logical_offset,
 };
 
+/// One FAT record for [`build_fat_bytes`], its fields named as in [`Entry`], which also numbers
+/// the records; the FAT stores no index.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FatRow {
+    pub(crate) name_hash: u32,
+    pub(crate) size: u32,
+    pub(crate) sector_number: u32,
+    pub(crate) spec_flags: u32,
+    pub(crate) deflated_size: i32,
+}
+
 /// One record for [`write_archive`]: its TOC fields and the bytes stored for it.
 #[derive(Clone, Copy)]
 pub(crate) struct ArchiveRecord<'a> {
@@ -58,14 +69,20 @@ impl<'a> ArchiveRecord<'a> {
         }
     }
 
-    /// The record's `(name_hash, size, sector_number, spec_flags, deflated_size)` TOC fields.
-    fn toc_fields(&self, sector: u32) -> (u32, u32, u32, u32, i32) {
-        let deflated = if self.compressed {
+    /// The record's FAT row, with its payload at `sector`.
+    fn fat_row(&self, sector: u32) -> FatRow {
+        let deflated_size = if self.compressed {
             i32::try_from(self.payload.len()).unwrap()
         } else {
             0
         };
-        (self.hash, self.size, sector, self.spec_flags, deflated)
+        FatRow {
+            name_hash: self.hash,
+            size: self.size,
+            sector_number: sector,
+            spec_flags: self.spec_flags,
+            deflated_size,
+        }
     }
 }
 
@@ -133,18 +150,18 @@ const fn encode_u32(endian: Endian, value: u32) -> [u8; 4] {
 }
 
 /// Serializes a bigfile FAT header (`count`, `hashes[count]`, `records[count]`) in `endian`
-/// byte order from `(name_hash, size, sector_number, spec_flags, deflated_size)` tuples.
-pub(crate) fn build_fat_bytes(endian: Endian, records: &[(u32, u32, u32, u32, i32)]) -> Vec<u8> {
+/// byte order from `records`.
+pub(crate) fn build_fat_bytes(endian: Endian, records: &[FatRow]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(fat_byte_len(records.len()).unwrap());
     buf.extend_from_slice(&encode_u32(endian, u32::try_from(records.len()).unwrap()));
-    for &(hash, _, _, _, _) in records {
-        buf.extend_from_slice(&encode_u32(endian, hash));
+    for record in records {
+        buf.extend_from_slice(&encode_u32(endian, record.name_hash));
     }
-    for &(_, size, sector, spec, deflated) in records {
-        buf.extend_from_slice(&encode_u32(endian, size));
-        buf.extend_from_slice(&encode_u32(endian, sector));
-        buf.extend_from_slice(&encode_u32(endian, spec));
-        buf.extend_from_slice(&encode_u32(endian, deflated.cast_unsigned()));
+    for record in records {
+        buf.extend_from_slice(&encode_u32(endian, record.size));
+        buf.extend_from_slice(&encode_u32(endian, record.sector_number));
+        buf.extend_from_slice(&encode_u32(endian, record.spec_flags));
+        buf.extend_from_slice(&encode_u32(endian, record.deflated_size.cast_unsigned()));
     }
     buf
 }
@@ -165,22 +182,33 @@ pub(crate) const fn sector_count(byte_count: u32) -> u32 {
 /// count that still fits, and all-zero records read the same either way.
 pub(crate) fn build_ambiguous_part0() -> Vec<u8> {
     let total_bytes = (SECTOR_BYTE_COUNT * 650) as usize;
-    let records = vec![(0, 0, 0, 0, 0); 0x0001_0000];
+    let records = vec![FatRow::default(); 0x0001_0000];
     build_part0_bytes(Endian::Big, total_bytes, &records, &[])
 }
 
-/// Builds a two-sector part 0 from `(name_hash, size, deflated_size)` records that all point at
-/// sector 1, so their planned output can far exceed the part's size.
-fn build_shared_sector_part0(records: &[(u32, u32, i32)]) -> Vec<u8> {
+/// Builds a two-sector part 0 from `records`, all at sector 1 with spec flags `1`, so their
+/// planned output can far exceed the part's size. Each row gives only its name hash, size and
+/// deflated size, leaving the sector and spec flags at zero for this to set.
+fn build_shared_sector_part0(records: &[FatRow]) -> Vec<u8> {
     let fat: Vec<_> = records
         .iter()
-        .map(|&(hash, size, deflated)| (hash, size, 1, 1, deflated))
+        .map(|&record| {
+            assert!(
+                record.sector_number == 0 && record.spec_flags == 0,
+                "a shared-sector row leaves its sector and spec flags at zero; the helper sets these itself"
+            );
+            FatRow {
+                sector_number: 1,
+                spec_flags: 1,
+                ..record
+            }
+        })
         .collect();
     build_part0_bytes(Endian::Little, (SECTOR_BYTE_COUNT * 2) as usize, &fat, &[])
 }
 
 /// Writes the two-sector part 0 of [`build_shared_sector_part0`] to `path`.
-pub(crate) fn write_shared_sector_archive(path: impl AsRef<Path>, records: &[(u32, u32, i32)]) {
+pub(crate) fn write_shared_sector_archive(path: impl AsRef<Path>, records: &[FatRow]) {
     fs::write(path, build_shared_sector_part0(records)).unwrap();
 }
 
@@ -204,7 +232,7 @@ pub(crate) fn write_archive(path: impl AsRef<Path>, endian: Endian, records: &[A
         path,
         endian,
         layout.end_sector,
-        &layout.toc,
+        &layout.rows,
         &layout.payloads,
     );
 }
@@ -237,13 +265,13 @@ pub(crate) fn write_two_part_archive(
         first.end_sector <= BLOCK_SECTOR_COUNT,
         "part 0 overflows its segment"
     );
-    let toc: Vec<_> = first.toc.iter().chain(&second.toc).copied().collect();
+    let rows: Vec<_> = first.rows.iter().chain(&second.rows).copied().collect();
     let part0_path = dir.join("bigfile.000");
     write_part0(
         part0_path,
         Endian::Little,
         first.end_sector,
-        &toc,
+        &rows,
         &first.payloads,
     );
 
@@ -260,8 +288,8 @@ fn first_payload_sector(record_count: usize) -> u32 {
 
 /// Records laid out one after another, each payload in its own sectors.
 struct RecordLayout<'a> {
-    /// Each record's TOC fields.
-    toc: Vec<(u32, u32, u32, u32, i32)>,
+    /// Each record's FAT row.
+    rows: Vec<FatRow>,
     /// Each record's `(sector_number, payload)`.
     payloads: Vec<(u32, &'a [u8])>,
     /// First sector after the last payload.
@@ -272,12 +300,12 @@ impl<'a> RecordLayout<'a> {
     /// Lays `records` out in the order given, the first starting at `first_sector`.
     fn new(records: &[ArchiveRecord<'a>], first_sector: u32) -> Self {
         let mut layout = Self {
-            toc: Vec::with_capacity(records.len()),
+            rows: Vec::with_capacity(records.len()),
             payloads: Vec::with_capacity(records.len()),
             end_sector: first_sector,
         };
         for record in records {
-            layout.toc.push(record.toc_fields(layout.end_sector));
+            layout.rows.push(record.fat_row(layout.end_sector));
             layout.payloads.push((layout.end_sector, record.payload));
             layout.end_sector += sector_count(u32::try_from(record.payload.len()).unwrap());
         }
@@ -336,7 +364,7 @@ pub(crate) fn write_part0(
     path: impl AsRef<Path>,
     endian: Endian,
     sectors: u32,
-    records: &[(u32, u32, u32, u32, i32)],
+    records: &[FatRow],
     payloads: &[(u32, &[u8])],
 ) {
     let total_bytes = usize::try_from(sector_logical_offset(sectors)).unwrap();
@@ -349,7 +377,14 @@ pub(crate) fn write_part0(
 
 /// Writes to `path` a two-sector part 0 holding one empty record at sector 1.
 pub(crate) fn write_one_empty_record(path: impl AsRef<Path>) {
-    write_part0(path, Endian::Little, 2, &[(0x5FF9_1900, 0, 1, 1, 0)], &[]);
+    let record = FatRow {
+        name_hash: 0x5FF9_1900,
+        size: 0,
+        sector_number: 1,
+        spec_flags: 1,
+        deflated_size: 0,
+    };
+    write_part0(path, Endian::Little, 2, &[record], &[]);
 }
 
 /// Builds a synthetic part-0 byte image of `total_bytes` length containing the serialized FAT
@@ -357,7 +392,7 @@ pub(crate) fn write_one_empty_record(path: impl AsRef<Path>) {
 pub(crate) fn build_part0_bytes(
     endian: Endian,
     total_bytes: usize,
-    records: &[(u32, u32, u32, u32, i32)],
+    records: &[FatRow],
     payloads: &[(u32, &[u8])],
 ) -> Vec<u8> {
     let fat = build_fat_bytes(endian, records);
@@ -374,4 +409,26 @@ fn place_payloads(part: &mut [u8], first_sector: u32, payloads: &[(u32, &[u8])])
         let start = usize::try_from(sector_logical_offset(sector - first_sector)).unwrap();
         part[start..start + data.len()].copy_from_slice(data);
     }
+}
+
+#[test]
+#[should_panic(expected = "sets these itself")]
+fn shared_sector_rows_cannot_choose_their_sector() {
+    build_shared_sector_part0(&[FatRow {
+        name_hash: 0x1,
+        size: 100,
+        sector_number: 5,
+        ..FatRow::default()
+    }]);
+}
+
+#[test]
+#[should_panic(expected = "sets these itself")]
+fn shared_sector_rows_cannot_choose_their_spec_flags() {
+    build_shared_sector_part0(&[FatRow {
+        name_hash: 0x1,
+        size: 100,
+        spec_flags: 0x2,
+        ..FatRow::default()
+    }]);
 }

@@ -841,7 +841,7 @@ mod tests {
     use super::*;
     use crate::format::{BLOCK_BYTE_COUNT, FAT_ENTRY_BYTES, SECTOR_BYTE_COUNT};
     use crate::test_support::{
-        ArchiveRecord, TempDir, build_ambiguous_part0, build_part0_bytes, write_archive,
+        ArchiveRecord, FatRow, TempDir, build_ambiguous_part0, build_part0_bytes, write_archive,
         write_one_empty_record, write_one_record_archives, write_part0, write_two_part_archive,
     };
 
@@ -981,9 +981,27 @@ mod tests {
     fn write_empty_record_at_part0_end(dir: &Path) {
         let part0_sectors = 512;
         let records = [
-            (1, 16, 1, 1, 0),
-            (2, 0, part0_sectors, 1, 0),
-            (3, 16, 2 * part0_sectors, 1, 0),
+            FatRow {
+                name_hash: 1,
+                size: 16,
+                sector_number: 1,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
+            FatRow {
+                name_hash: 2,
+                size: 0,
+                sector_number: part0_sectors,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
+            FatRow {
+                name_hash: 3,
+                size: 16,
+                sector_number: 2 * part0_sectors,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
         ];
         write_part0(
             dir.join("bigfile.000"),
@@ -1044,9 +1062,27 @@ mod tests {
     fn write_part1_starting_with_empty_record(dir: &Path) {
         let part0_sectors = 512;
         let records = [
-            (1, 16, 1, 1, 0),
-            (2, 0, 2 * part0_sectors, 1, 0),
-            (3, 16, 2 * part0_sectors + 1, 1, 0),
+            FatRow {
+                name_hash: 1,
+                size: 16,
+                sector_number: 1,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
+            FatRow {
+                name_hash: 2,
+                size: 0,
+                sector_number: 2 * part0_sectors,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
+            FatRow {
+                name_hash: 3,
+                size: 16,
+                sector_number: 2 * part0_sectors + 1,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
         ];
         write_part0(
             dir.join("bigfile.000"),
@@ -1154,7 +1190,13 @@ mod tests {
             dir.join("bigfile.000"),
             Endian::Little,
             2,
-            &[(0x5FF9_1900, 0, 512, 1, 0)],
+            &[FatRow {
+                name_hash: 0x5FF9_1900,
+                size: 0,
+                sector_number: 512,
+                spec_flags: 1,
+                deflated_size: 0,
+            }],
             &[],
         );
 
@@ -1302,7 +1344,13 @@ mod tests {
         let records: Vec<_> = (0..0x0001_0000u32)
             .map(|i| {
                 let hash = if i < 256 { 0 } else { 0x0000_0100 };
-                (hash, 0, 645, 1, 0)
+                FatRow {
+                    name_hash: hash,
+                    size: 0,
+                    sector_number: 645,
+                    spec_flags: 1,
+                    deflated_size: 0,
+                }
             })
             .collect();
         write_part0(dir.join("bigfile.000"), Endian::Big, 650, &records, &[]);
@@ -1382,7 +1430,15 @@ mod tests {
     #[test]
     fn fat_bytes_reads_only_the_missing_tail_for_the_second_byte_order() {
         let dir = TempDir::new("fat_bytes_tail");
-        let records: Vec<_> = (0..0x0001_0000u32).map(|i| (i, i, 0, 1, 0)).collect();
+        let records: Vec<_> = (0..0x0001_0000u32)
+            .map(|i| FatRow {
+                name_hash: i,
+                size: i,
+                sector_number: 0,
+                spec_flags: 1,
+                deflated_size: 0,
+            })
+            .collect();
         let path = dir.join("bigfile.000");
         fs::write(&path, build_part0_bytes(Endian::Big, 0, &records, &[])).unwrap();
         let file = File::open(&path).unwrap();

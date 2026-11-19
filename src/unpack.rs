@@ -197,7 +197,7 @@ mod tests {
     use crate::format::Endian;
     use crate::hash::name_hash;
     use crate::test_support::{
-        ArchiveRecord, TempDir, open_patched_pair, write_archive, write_patched_archives,
+        ArchiveRecord, FatRow, TempDir, open_patched_pair, write_archive, write_patched_archives,
         write_shared_sector_archive, zlib_compress,
     };
 
@@ -264,8 +264,9 @@ mod tests {
         );
     }
 
-    /// Archive holding one record per `(hash, size, deflated_size)`, all stored at sector 1.
-    fn open_shared_sector_archive(tmp: &TempDir, records: &[(u32, u32, i32)]) -> Bigfile {
+    /// Archive holding `records`, which [`write_shared_sector_archive`] stores at sector 1 with spec
+    /// flags `1`, so each row gives only its name hash, size and deflated size.
+    fn open_shared_sector_archive(tmp: &TempDir, records: &[FatRow]) -> Bigfile {
         let path = tmp.join("bigfile.000");
         write_shared_sector_archive(&path, records);
         Bigfile::open(&path).unwrap()
@@ -283,7 +284,21 @@ mod tests {
     #[test]
     fn output_limit_is_checked_before_anything_is_written() {
         let tmp = TempDir::new("limit_before_write");
-        let bf = open_shared_sector_archive(&tmp, &[(0x1, 100, 0), (0x2, 100, 0)]);
+        let bf = open_shared_sector_archive(
+            &tmp,
+            &[
+                FatRow {
+                    name_hash: 0x1,
+                    size: 100,
+                    ..FatRow::default()
+                },
+                FatRow {
+                    name_hash: 0x2,
+                    size: 100,
+                    ..FatRow::default()
+                },
+            ],
+        );
         let out = tmp.join("out");
 
         let err = unpack_with_limit(&bf, &out, false, 199);
@@ -301,7 +316,21 @@ mod tests {
     #[test]
     fn output_limit_allows_output_of_exactly_the_limit() {
         let tmp = TempDir::new("limit_exact");
-        let bf = open_shared_sector_archive(&tmp, &[(0x1, 100, 0), (0x2, 100, 0)]);
+        let bf = open_shared_sector_archive(
+            &tmp,
+            &[
+                FatRow {
+                    name_hash: 0x1,
+                    size: 100,
+                    ..FatRow::default()
+                },
+                FatRow {
+                    name_hash: 0x2,
+                    size: 100,
+                    ..FatRow::default()
+                },
+            ],
+        );
         let options = UnpackOptions {
             max_output_bytes: Some(200),
             ..UnpackOptions::default()
@@ -316,7 +345,15 @@ mod tests {
     #[test]
     fn output_limit_counts_stored_size_when_raw() {
         let tmp = TempDir::new("limit_raw");
-        let bf = open_shared_sector_archive(&tmp, &[(0x1, 5000, 40)]);
+        let bf = open_shared_sector_archive(
+            &tmp,
+            &[FatRow {
+                name_hash: 0x1,
+                size: 5000,
+                deflated_size: 40,
+                ..FatRow::default()
+            }],
+        );
         let out = tmp.join("out");
 
         let err = unpack_with_limit(&bf, &out, true, 39);
@@ -330,7 +367,15 @@ mod tests {
     #[test]
     fn output_limit_counts_inflated_size_of_compressed_entries() {
         let tmp = TempDir::new("limit_inflated");
-        let bf = open_shared_sector_archive(&tmp, &[(0x1, 5000, 40)]);
+        let bf = open_shared_sector_archive(
+            &tmp,
+            &[FatRow {
+                name_hash: 0x1,
+                size: 5000,
+                deflated_size: 40,
+                ..FatRow::default()
+            }],
+        );
         let out = tmp.join("out");
 
         let err = unpack_with_limit(&bf, &out, false, 4999);
@@ -890,7 +935,21 @@ mod tests {
     #[test]
     fn dry_run_reports_output_over_the_limit() {
         let tmp = TempDir::new("dry_run_limit");
-        let bf = open_shared_sector_archive(&tmp, &[(1, 2048, 0), (2, 2048, 0)]);
+        let bf = open_shared_sector_archive(
+            &tmp,
+            &[
+                FatRow {
+                    name_hash: 1,
+                    size: 2048,
+                    ..FatRow::default()
+                },
+                FatRow {
+                    name_hash: 2,
+                    size: 2048,
+                    ..FatRow::default()
+                },
+            ],
+        );
         let options = UnpackOptions {
             max_output_bytes: Some(1),
             ..dry_run_options()

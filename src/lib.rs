@@ -165,7 +165,8 @@ mod tests {
     use super::*;
     use crate::format::{BLOCK_BYTE_COUNT, BLOCK_SECTOR_COUNT, SECTOR_BYTE_COUNT};
     use crate::test_support::{
-        ArchiveRecord, TempDir, build_part0_bytes, write_archive, write_part0, zlib_compress,
+        ArchiveRecord, FatRow, TempDir, build_part0_bytes, write_archive, write_part0,
+        zlib_compress,
     };
 
     /// Path of the compressed entry in [`write_two_entry_archive`].
@@ -231,8 +232,20 @@ mod tests {
     fn create_one_block_stride_archive(prefix: &str, part1_len: usize) -> TempDir {
         let dir = TempDir::new(prefix);
         let records = [
-            (0x1000_0001, 16, 1, 1, 0),
-            (0x1000_0002, 16, BLOCK_SECTOR_COUNT, 1, 0),
+            FatRow {
+                name_hash: 0x1000_0001,
+                size: 16,
+                sector_number: 1,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
+            FatRow {
+                name_hash: 0x1000_0002,
+                size: 16,
+                sector_number: BLOCK_SECTOR_COUNT,
+                spec_flags: 1,
+                deflated_size: 0,
+            },
         ];
         let part0 = build_part0_bytes(
             Endian::Little,
@@ -305,7 +318,13 @@ mod tests {
             dir.join("bigfile.000"),
             Endian::Little,
             2,
-            &[(0x1234_5678, 3000, 5, 1, 0)],
+            &[FatRow {
+                name_hash: 0x1234_5678,
+                size: 3000,
+                sector_number: 5,
+                spec_flags: 1,
+                deflated_size: 0,
+            }],
             &[],
         );
 
@@ -320,7 +339,13 @@ mod tests {
             dir.join("bigfile.000"),
             Endian::Little,
             2,
-            &[(0x1234_5678, 128, 0, 1, 0)],
+            &[FatRow {
+                name_hash: 0x1234_5678,
+                size: 128,
+                sector_number: 0,
+                spec_flags: 1,
+                deflated_size: 0,
+            }],
             &[],
         );
 

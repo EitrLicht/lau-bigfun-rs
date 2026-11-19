@@ -583,14 +583,20 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_support::build_fat_bytes;
+    use crate::test_support::{FatRow, build_fat_bytes};
 
     /// Parses a FAT from `(name_hash, spec_flags)` pairs, with each record's size set to its index.
     fn fat_from_hash_flags(records: &[(u32, u32)]) -> Fat {
         let records: Vec<_> = records
             .iter()
             .enumerate()
-            .map(|(index, &(hash, flags))| (hash, u32::try_from(index).unwrap(), 1, flags, 0))
+            .map(|(index, &(hash, flags))| FatRow {
+                name_hash: hash,
+                size: u32::try_from(index).unwrap(),
+                sector_number: 1,
+                spec_flags: flags,
+                deflated_size: 0,
+            })
             .collect();
         Fat::parse(&mut Cursor::new(build_fat_bytes(Endian::Little, &records))).unwrap()
     }
@@ -685,47 +691,126 @@ mod tests {
         assert_every_hash_found(&records);
     }
 
-    #[test]
-    fn parses_valid_fat_records() {
+    /// A little-endian FAT of four records: an uncompressed one, two sharing hash `0x2000` (the
+    /// second compressed to 120 bytes), and another uncompressed one.
+    fn four_record_fat() -> Fat {
         let bytes = build_fat_bytes(
             Endian::Little,
             &[
-                (0x1000, 100, 1, 0xFFFF_F7E1, 0),
-                (0x2000, 200, 2, 0xFFFF_F7E1, 0),
-                (0x2000, 250, 3, 0xFFFF_F7E2, 120),
-                (0x3000, 300, 4, 0xFFFF_FFFF, 0),
+                FatRow {
+                    name_hash: 0x1000,
+                    size: 100,
+                    sector_number: 1,
+                    spec_flags: 0xFFFF_F7E1,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 200,
+                    sector_number: 2,
+                    spec_flags: 0xFFFF_F7E1,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 250,
+                    sector_number: 3,
+                    spec_flags: 0xFFFF_F7E2,
+                    deflated_size: 120,
+                },
+                FatRow {
+                    name_hash: 0x3000,
+                    size: 300,
+                    sector_number: 4,
+                    spec_flags: 0xFFFF_FFFF,
+                    deflated_size: 0,
+                },
             ],
         );
-        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+        Fat::parse(&mut Cursor::new(bytes)).unwrap()
+    }
+
+    #[test]
+    fn parses_valid_little_endian_fat_records() {
+        let fat = four_record_fat();
         assert_eq!(fat.endian(), Endian::Little);
         assert_eq!(fat.len(), 4);
-        assert_eq!(fat.hash_runs().count(), 3);
+        let third = &fat.entries()[2];
+        assert_eq!(
+            (third.name_hash, third.size, third.sector_number),
+            (0x2000, 250, 3)
+        );
+        assert_eq!((third.spec_flags, third.deflated_size), (0xFFFF_F7E2, 120));
+    }
 
-        let v2000 = fat.find_all(0x2000);
-        assert_eq!(v2000.len(), 2);
-        assert_eq!(v2000[0].size, 200);
-        assert_eq!(v2000[0].stored_size(), 200);
-        assert!(!v2000[0].is_compressed());
-        assert_eq!(v2000[1].size, 250);
-        assert_eq!(v2000[1].stored_size(), 120);
-        assert!(v2000[1].is_compressed());
+    #[test]
+    fn hash_runs_group_records_sharing_a_hash() {
+        let run_lengths: Vec<usize> = four_record_fat().hash_runs().map(<[Entry]>::len).collect();
+        assert_eq!(run_lengths, [1, 2, 1]);
+    }
+
+    #[test]
+    fn find_all_returns_every_record_of_a_hash_in_order() {
+        let fat = four_record_fat();
+        let sizes: Vec<u32> = fat
+            .find_all(0x2000)
+            .iter()
+            .map(|entry| entry.size)
+            .collect();
+        assert_eq!(sizes, [200, 250]);
+    }
+
+    #[test]
+    fn entry_without_a_deflated_size_is_stored_uncompressed() {
+        let fat = four_record_fat();
+        let entry = &fat.entries()[1];
+        assert!(!entry.is_compressed());
+        assert_eq!(entry.stored_size(), entry.size);
+    }
+
+    #[test]
+    fn entry_with_a_deflated_size_is_stored_compressed() {
+        let fat = four_record_fat();
+        let entry = &fat.entries()[2];
+        assert!(entry.is_compressed());
+        assert_eq!(entry.stored_size(), 120);
+    }
+
+    /// The bytes of a big-endian FAT of two records, the second compressed.
+    fn big_endian_fat_bytes() -> Vec<u8> {
+        build_fat_bytes(
+            Endian::Big,
+            &[
+                FatRow {
+                    name_hash: 0x1000,
+                    size: 100,
+                    sector_number: 1,
+                    spec_flags: 0xFFFF_F7E1,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 250,
+                    sector_number: 3,
+                    spec_flags: 0xFFFF_F7E2,
+                    deflated_size: 120,
+                },
+            ],
+        )
     }
 
     #[test]
     fn auto_detects_big_endian_fat_records() {
-        let bytes = build_fat_bytes(
-            Endian::Big,
-            &[
-                (0x1000, 100, 1, 0xFFFF_F7E1, 0),
-                (0x2000, 250, 3, 0xFFFF_F7E2, 120),
-            ],
-        );
-        let fat = Fat::parse(&mut Cursor::new(&bytes)).unwrap();
+        let fat = Fat::parse(&mut Cursor::new(big_endian_fat_bytes())).unwrap();
         assert_eq!(fat.endian(), Endian::Big);
         assert_eq!(fat.len(), 2);
         assert_eq!(fat.entries()[1].size, 250);
         assert_eq!(fat.entries()[1].deflated_size, 120);
+    }
 
+    #[test]
+    fn forced_little_endian_rejects_a_big_endian_fat() {
+        let bytes = big_endian_fat_bytes();
         let err = Fat::parse_bounded(
             &mut Cursor::new(&bytes),
             Some(bytes.len() as u64),
@@ -744,7 +829,13 @@ mod tests {
     #[test]
     fn falls_back_to_larger_endian_candidate_when_smaller_hashes_unsorted() {
         let records: Vec<_> = (0..0x0001_0000u32)
-            .map(|i| (if i == 0 { 1 } else { 0x0100 }, 16, i + 1, 1, 0))
+            .map(|i| FatRow {
+                name_hash: if i == 0 { 1 } else { 0x0100 },
+                size: 16,
+                sector_number: i + 1,
+                spec_flags: 1,
+                deflated_size: 0,
+            })
             .collect();
         let bytes = build_fat_bytes(Endian::Big, &records);
         let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
@@ -752,35 +843,80 @@ mod tests {
         assert_eq!(fat.len(), 0x0001_0000);
     }
 
-    #[test]
-    fn finds_spec_masked_variants() {
+    /// A FAT of three variants of hash `0x2000`, with spec flags `0b0011`, `0b0111` and `0b0010`
+    /// and sizes 100, 200 and 250.
+    fn spec_variant_fat() -> Fat {
         let bytes = build_fat_bytes(
             Endian::Little,
             &[
-                (0x2000, 100, 1, 0b0011, 0),
-                (0x2000, 200, 2, 0b0111, 0),
-                (0x2000, 250, 3, 0b0010, 0),
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 100,
+                    sector_number: 1,
+                    spec_flags: 0b0011,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 200,
+                    sector_number: 2,
+                    spec_flags: 0b0111,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 250,
+                    sector_number: 3,
+                    spec_flags: 0b0010,
+                    deflated_size: 0,
+                },
             ],
         );
-        let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
+        Fat::parse(&mut Cursor::new(bytes)).unwrap()
+    }
 
-        let spec1 = fat.find_with_spec_mask(0x2000, 0b0011).unwrap();
-        assert_eq!(spec1.size, 200);
-        let spec2 = fat.find_with_spec_mask(0x2000, 0b0100).unwrap();
-        assert_eq!(spec2.size, 200);
-        assert!(fat.find_with_spec_mask(0x2000, 0b1000).is_none());
+    #[test]
+    fn find_with_spec_mask_picks_one_matching_variant() {
+        let fat = spec_variant_fat();
+        let size_for = |mask| {
+            fat.find_with_spec_mask(0x2000, mask)
+                .map(|entry| entry.size)
+        };
+        assert_eq!(size_for(0b0011), Some(200));
+        assert_eq!(size_for(0b0100), Some(200));
+        assert_eq!(size_for(0b1000), None);
+    }
 
-        let all_spec1: Vec<&Entry> = fat.find_all_with_spec_mask(0x2000, 0b0011).collect();
-        assert_eq!(all_spec1.len(), 2);
-        assert_eq!(all_spec1[0].size, 100);
-        assert_eq!(all_spec1[1].size, 200);
+    #[test]
+    fn find_all_with_spec_mask_returns_every_match_in_order() {
+        let fat = spec_variant_fat();
+        let sizes: Vec<u32> = fat
+            .find_all_with_spec_mask(0x2000, 0b0011)
+            .map(|entry| entry.size)
+            .collect();
+        assert_eq!(sizes, [100, 200]);
     }
 
     #[test]
     fn rejects_unsorted_hashes() {
         let bytes = build_fat_bytes(
             Endian::Little,
-            &[(0x2000, 100, 1, 0x1, 0), (0x1000, 100, 2, 0x1, 0)],
+            &[
+                FatRow {
+                    name_hash: 0x2000,
+                    size: 100,
+                    sector_number: 1,
+                    spec_flags: 0x1,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x1000,
+                    size: 100,
+                    sector_number: 2,
+                    spec_flags: 0x1,
+                    deflated_size: 0,
+                },
+            ],
         );
         let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
         assert!(matches!(
@@ -796,7 +932,16 @@ mod tests {
 
     #[test]
     fn rejects_negative_deflated_size() {
-        let bytes = build_fat_bytes(Endian::Little, &[(0x1000, 100, 1, 0x1, -5)]);
+        let bytes = build_fat_bytes(
+            Endian::Little,
+            &[FatRow {
+                name_hash: 0x1000,
+                size: 100,
+                sector_number: 1,
+                spec_flags: 0x1,
+                deflated_size: -5,
+            }],
+        );
         let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
         assert!(matches!(
             err,
@@ -812,7 +957,16 @@ mod tests {
 
     #[test]
     fn rejects_truncated_fat() {
-        let mut bytes = build_fat_bytes(Endian::Little, &[(0x1000, 100, 1, 0x1, 0)]);
+        let mut bytes = build_fat_bytes(
+            Endian::Little,
+            &[FatRow {
+                name_hash: 0x1000,
+                size: 100,
+                sector_number: 1,
+                spec_flags: 0x1,
+                deflated_size: 0,
+            }],
+        );
         bytes.pop();
         let err = Fat::parse(&mut Cursor::new(bytes)).unwrap_err();
         assert!(matches!(
@@ -869,7 +1023,22 @@ mod tests {
     fn header_byte_size_counts_every_record() {
         let bytes = build_fat_bytes(
             Endian::Little,
-            &[(0x1000, 100, 1, 0b0011, 0), (0x1000, 200, 2, 0b0111, 0)],
+            &[
+                FatRow {
+                    name_hash: 0x1000,
+                    size: 100,
+                    sector_number: 1,
+                    spec_flags: 0b0011,
+                    deflated_size: 0,
+                },
+                FatRow {
+                    name_hash: 0x1000,
+                    size: 200,
+                    sector_number: 2,
+                    spec_flags: 0b0111,
+                    deflated_size: 0,
+                },
+            ],
         );
         let fat = Fat::parse(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(fat.header_byte_size(), 4 + 2 * 20);

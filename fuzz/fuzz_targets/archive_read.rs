@@ -8,7 +8,6 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::OnceLock;
 
 use lau_bigfun::{ArchiveSet, Bigfile, BigfileError, Entry, OpenOptions};
 use libfuzzer_sys::fuzz_target;
@@ -112,8 +111,7 @@ fn resolve_through_patch(dir: &Path, bf: Bigfile) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-    let dir = DIR.get_or_init(lau_bigfun_fuzz::scratch_dir);
+    let dir = lau_bigfun_fuzz::scratch_dir();
     if write_parts(dir, data).is_some()
         && let Ok(bf) = Bigfile::open(dir.join("bigfile.000"))
     {

@@ -2,6 +2,12 @@
 
 Notable changes to `lau-bigfun`, newest first. Versions not listed here were never published.
 
+## 0.5.1 - 2026-11-19
+
+### Fixed
+
+- On Windows, on a drive where Windows cannot resolve a path's own spelling, `extract` and `unpack` now also recognise an archive part named with different letter case in a script beyond Latin-1, such as Cyrillic or Greek, and refuse it with `BigfileError::OutputIsArchivePart`. The part was already safe, because it is opened sharing only reading, but the write failed with Windows' less clear sharing error instead.
+
 ## 0.5.0 - 2026-11-19
 
 The library changes under **Changed** are breaking. The command-line tool is used as before; it gains the fixes under **Fixed**, one of which can change where `unpack` writes a file.

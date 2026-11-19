@@ -204,10 +204,11 @@ impl FileId {
     }
 }
 
-/// Comparison key of an absolute Windows path: without a `\\?\` verbatim prefix, folded like
-/// [`normalized_rel_key`] (`/` separators, ASCII and Latin-1 letters lowercase). The canonical
-/// (verbatim) and absolute spellings of one path give the same key, as do spellings that differ
-/// only in letter case, which Windows filesystems ignore.
+/// Comparison key of an absolute Windows path: without a `\\?\` verbatim prefix, with `/`
+/// separators and letters folded by [`fold_windows_path_char`]. The canonical (verbatim) and
+/// absolute spellings of one path give the same key, as do spellings that differ only in letter
+/// case, which Windows filesystems ignore. Unlike [`normalized_rel_key`], whose archive names are
+/// Latin-1, it folds letters of any script, since an absolute path can hold any.
 #[cfg(any(windows, test))]
 fn windows_path_key(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -215,7 +216,21 @@ fn windows_path_key(path: &Path) -> String {
         Some(unc) => Cow::Owned(format!(r"\\{unc}")),
         None => Cow::Borrowed(text.strip_prefix(r"\\?\").unwrap_or(&text)),
     };
-    normalized_rel_key(Path::new(unprefixed.as_ref()))
+    unprefixed.chars().map(fold_windows_path_char).collect()
+}
+
+/// Folds a character of a Windows path for [`windows_path_key`]: `\` becomes `/`, and a letter
+/// with a one-character uppercase form becomes that form. Windows filesystems compare names one
+/// character at a time through an uppercase table, so a letter whose uppercase is several
+/// characters, such as `ß`, stays as it is.
+#[cfg(any(windows, test))]
+fn fold_windows_path_char(c: char) -> char {
+    let c = forward_slash(c);
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
 }
 
 /// Appends `suffix` to the file stem of `path`, before any extension.
@@ -263,6 +278,22 @@ mod tests {
         assert_eq!(
             windows_path_key(Path::new(r"C:\Games\TR\BIGFILE.000")),
             windows_path_key(Path::new(r"c:\games\tr\bigfile.000"))
+        );
+    }
+
+    #[test]
+    fn windows_key_ignores_letter_case_beyond_latin1() {
+        assert_eq!(
+            windows_path_key(Path::new(r"D:\Игры\Λάρα\BIGFILE.000")),
+            windows_path_key(Path::new(r"d:\игры\λάρα\bigfile.000"))
+        );
+    }
+
+    #[test]
+    fn windows_key_keeps_a_letter_whose_uppercase_is_two_letters() {
+        assert_ne!(
+            windows_path_key(Path::new(r"C:\Straße\bigfile.000")),
+            windows_path_key(Path::new(r"C:\STRASSE\bigfile.000"))
         );
     }
 

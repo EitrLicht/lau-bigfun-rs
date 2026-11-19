@@ -5,7 +5,13 @@ use super::*;
 /// Writes an archive of 40 records that all share one sector, so its planned output is far larger
 /// than the archive itself, and returns the paths of the archive and an output directory.
 fn create_amplified_archive(dir: &TempDir) -> (PathBuf, PathBuf) {
-    let records: Vec<_> = (1..=40).map(|hash| (hash, 2048, 0)).collect();
+    let records: Vec<_> = (1..=40)
+        .map(|hash| FatRow {
+            name_hash: hash,
+            size: 2048,
+            ..FatRow::default()
+        })
+        .collect();
     let archive_path = dir.join("bigfile.000");
     write_shared_sector_archive(&archive_path, &records);
     (archive_path, dir.join("out"))

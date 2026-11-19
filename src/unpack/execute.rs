@@ -311,13 +311,20 @@ pub fn extract_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, write_shared_sector_archive};
+    use crate::test_support::{FatRow, TempDir, write_shared_sector_archive};
 
     #[test]
     fn missing_staging_folder_names_the_staged_file() {
         let tmp = TempDir::new("error_names_staged");
         let path = tmp.join("bigfile.000");
-        write_shared_sector_archive(&path, &[(0x1, 100, 0)]);
+        write_shared_sector_archive(
+            &path,
+            &[FatRow {
+                name_hash: 0x1,
+                size: 100,
+                ..FatRow::default()
+            }],
+        );
         let bf = Bigfile::open(&path).unwrap();
         let item = PlannedExtraction {
             archive_rank: 0,
