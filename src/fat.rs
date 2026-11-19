@@ -15,6 +15,7 @@ use crate::format::{
 /// Each variant except [`Io`](Self::Io) names the byte order the FAT was read in, since byte-order
 /// detection tries both.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FatError {
     /// Reading the FAT failed.
     #[error("I/O error while reading FAT: {0}")]
@@ -144,6 +145,31 @@ impl Entry {
     pub const fn matches_spec_mask(&self, spec_mask: u32) -> bool {
         (self.spec_flags & spec_mask) == spec_mask
     }
+}
+
+/// A [`Fat::try_auto_endian`] attempt in one byte order that failed, handing back the `state` it
+/// was given so the other byte order can be tried with it.
+pub(crate) struct FailedAttempt<S, E> {
+    /// The state the attempt was given.
+    pub(crate) state: S,
+    /// Why it failed.
+    pub(crate) error: E,
+}
+
+/// The result of the first byte order [`Fat::try_auto_endian`] tried that worked.
+pub(crate) struct Detected<T> {
+    /// The attempt's result.
+    pub(crate) value: T,
+    /// The other byte order, when it was never tried because the preferred one worked.
+    pub(crate) untried: Option<Endian>,
+}
+
+/// The errors from both byte orders when neither worked.
+pub(crate) struct BothFailed<E> {
+    /// The error of the preferred byte order, tried first.
+    pub(crate) preferred: E,
+    /// The error of the other byte order.
+    pub(crate) other: E,
 }
 
 /// Tomb Raider LAU File Allocation Table.
@@ -293,19 +319,28 @@ impl Fat {
     }
 
     /// Tries `attempt` with the preferred byte order for `header`, then with the other one if that
-    /// fails, threading `state` (such as the reader and buffer an attempt reads with) through both.
-    /// Returns the first success with the other byte order still untried, if any, or both errors.
+    /// fails, handing `state` (such as the reader and buffer an attempt reads with) from the first
+    /// attempt to the second. Returns the first success, or both errors.
     pub(crate) fn try_auto_endian<S, T, E>(
         header: [u8; 4],
         state: S,
-        mut attempt: impl FnMut(S, Endian) -> Result<T, (S, E)>,
-    ) -> Result<(T, Option<Endian>), (E, E)> {
+        mut attempt: impl FnMut(S, Endian) -> Result<T, FailedAttempt<S, E>>,
+    ) -> Result<Detected<T>, BothFailed<E>> {
         let [preferred, other] = Self::auto_endian_order(header);
         match attempt(state, preferred) {
-            Ok(found) => Ok((found, Some(other))),
-            Err((state, first_err)) => match attempt(state, other) {
-                Ok(found) => Ok((found, None)),
-                Err((_, second_err)) => Err((first_err, second_err)),
+            Ok(value) => Ok(Detected {
+                value,
+                untried: Some(other),
+            }),
+            Err(first) => match attempt(first.state, other) {
+                Ok(value) => Ok(Detected {
+                    value,
+                    untried: None,
+                }),
+                Err(second) => Err(BothFailed {
+                    preferred: first.error,
+                    other: second.error,
+                }),
             },
         }
     }
@@ -322,10 +357,10 @@ impl Fat {
     ) -> Result<Self, FatError> {
         Self::try_auto_endian(header, (), |(), endian| {
             Self::try_candidate(reader, buf, header, max_file_bytes, endian)
-                .map_err(|err| ((), err))
+                .map_err(|error| FailedAttempt { state: (), error })
         })
-        .map(|(fat, _)| fat)
-        .map_err(|(primary_err, _)| primary_err)
+        .map(|detected| detected.value)
+        .map_err(|both| both.preferred)
     }
 
     /// Parses the FAT body in `endian` byte order: checks that it fits in `max_file_bytes`, reads
@@ -555,7 +590,7 @@ mod tests {
         let records: Vec<_> = records
             .iter()
             .enumerate()
-            .map(|(index, &(hash, flags))| (hash, index as u32, 1, flags, 0))
+            .map(|(index, &(hash, flags))| (hash, u32::try_from(index).unwrap(), 1, flags, 0))
             .collect();
         Fat::parse(&mut Cursor::new(build_fat_bytes(Endian::Little, &records))).unwrap()
     }

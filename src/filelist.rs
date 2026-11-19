@@ -3,8 +3,8 @@
 //! Archives store only path hashes, so names come from filelists the caller supplies.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -14,6 +14,7 @@ use crate::path::sanitize_relative_path;
 
 /// Errors that can occur when loading a filelist from disk or string.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FilelistError {
     /// The filelist file could not be read.
     #[error("failed to read filelist '{path}': {source}")]
@@ -25,6 +26,16 @@ pub enum FilelistError {
         source: io::Error,
     },
 
+    /// The file is larger than [`HashDictionary::load_file`] reads, which a filelist never is: an
+    /// archive part passed as a filelist, for example.
+    #[error("'{path}' is larger than a filelist can be ({} MiB); is it an archive?", .limit / (1024 * 1024))]
+    TooLarge {
+        /// Path of the file.
+        path: PathBuf,
+        /// The limit in bytes.
+        limit: u64,
+    },
+
     /// A line holds a name that cannot be hashed.
     #[error("invalid filename on line {line}: {source}")]
     InvalidFilename {
@@ -34,6 +45,22 @@ pub enum FilelistError {
         #[source]
         source: NonLatin1CharError,
     },
+}
+
+/// Largest file [`HashDictionary::load_file`] reads (64 MiB). Retail filelists are under 1 MiB, so
+/// a larger file is not a filelist, and reading it whole could exhaust memory.
+const MAX_FILELIST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Where an entry unpacks to, relative to the output directory, as
+/// [`HashDictionary::relative_path_or_fallback`] chooses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RelativeOutputPath {
+    /// The sanitized path the dictionary names, or `__unknown/<name_hash:08x>.bin` when it names
+    /// none.
+    pub path: PathBuf,
+    /// `true` when the dictionary named the hash, so `path` comes from its asset path.
+    pub resolved: bool,
 }
 
 /// Maps 32-bit `CRC-32/BZIP2` path hashes back to their human-readable asset paths.
@@ -107,14 +134,23 @@ impl HashDictionary {
     ///
     /// # Errors
     ///
-    /// [`FilelistError::Io`] when the file cannot be read, and otherwise fails like
-    /// [`Self::load_str`].
+    /// [`FilelistError::Io`] when the file cannot be read, [`FilelistError::TooLarge`] when it is
+    /// over 64 MiB, and otherwise fails like [`Self::load_str`].
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, FilelistError> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|source| FilelistError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| file.take(MAX_FILELIST_BYTES + 1).read_to_end(&mut bytes))
+            .map_err(|source| FilelistError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if bytes.len() as u64 > MAX_FILELIST_BYTES {
+            return Err(FilelistError::TooLarge {
+                path: path.to_path_buf(),
+                limit: MAX_FILELIST_BYTES,
+            });
+        }
         match String::from_utf8(bytes) {
             Ok(text) => self.load_str(&text),
             Err(err) => self.load_str(&Self::decode_filelist_bytes(err.as_bytes())),
@@ -158,24 +194,27 @@ impl HashDictionary {
     }
 
     /// Returns a safe relative output path for `name_hash`, and whether the dictionary named it:
-    /// - If found in the dictionary, returns the sanitized relative path (`pc-w/lara.drm`) and
-    ///   `true`.
-    /// - Otherwise, returns `__unknown/<name_hash:08x>.bin` and `false`.
+    /// - If found in the dictionary, the sanitized relative path (`pc-w/lara.drm`), resolved.
+    /// - Otherwise, `__unknown/<name_hash:08x>.bin`, not resolved.
     #[must_use]
-    pub fn relative_path_or_fallback(&self, name_hash: u32) -> (PathBuf, bool) {
-        if let Some(known) = self.get(name_hash) {
-            (sanitize_relative_path(known), true)
-        } else {
-            (
-                PathBuf::from("__unknown").join(format!("{name_hash:08x}.bin")),
-                false,
-            )
+    pub fn relative_path_or_fallback(&self, name_hash: u32) -> RelativeOutputPath {
+        match self.get(name_hash) {
+            Some(known) => RelativeOutputPath {
+                path: sanitize_relative_path(known),
+                resolved: true,
+            },
+            None => RelativeOutputPath {
+                path: PathBuf::from("__unknown").join(format!("{name_hash:08x}.bin")),
+                resolved: false,
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::hash::name_hash_bytes;
     use crate::test_support::TempDir;
@@ -194,15 +233,22 @@ mod tests {
         assert_eq!(dict.get(0x5FF9_1900), Some(r"PC-W\LARA.DRM"));
         dict.load_str("pc-w\\lara.drm\n").unwrap();
         assert_eq!(dict.get(0x5FF9_1900), Some(r"pc-w\lara.drm"));
+    }
 
-        assert_eq!(
-            dict.relative_path_or_fallback(0x5FF9_1900),
-            (PathBuf::from("pc-w/lara.drm"), true)
-        );
-        assert_eq!(
-            dict.relative_path_or_fallback(0xDEAD_BEEF),
-            (PathBuf::from("__unknown/deadbeef.bin"), false)
-        );
+    #[test]
+    fn named_hash_gets_its_sanitized_path_marked_resolved() {
+        let mut dict = HashDictionary::new();
+        dict.load_str("pc-w\\lara.drm\n").unwrap();
+        let output = dict.relative_path_or_fallback(0x5FF9_1900);
+        assert_eq!(output.path, PathBuf::from("pc-w/lara.drm"));
+        assert!(output.resolved);
+    }
+
+    #[test]
+    fn unnamed_hash_falls_back_to_the_unknown_folder() {
+        let output = HashDictionary::new().relative_path_or_fallback(0xDEAD_BEEF);
+        assert_eq!(output.path, PathBuf::from("__unknown/deadbeef.bin"));
+        assert!(!output.resolved);
     }
 
     #[test]
@@ -253,5 +299,33 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/path/to/custom_filelist.txt");
         let io_err = dict.load_file(&missing).unwrap_err();
         assert!(matches!(io_err, FilelistError::Io { path, .. } if path == missing));
+    }
+
+    #[test]
+    fn too_large_error_gives_the_limit_in_mib() {
+        let err = FilelistError::TooLarge {
+            path: PathBuf::from("bigfile.000"),
+            limit: MAX_FILELIST_BYTES,
+        };
+        assert_eq!(
+            err.to_string(),
+            "'bigfile.000' is larger than a filelist can be (64 MiB); is it an archive?"
+        );
+    }
+
+    #[test]
+    fn rejects_file_over_the_size_limit() {
+        let dir = TempDir::new("filelist_too_large");
+        let path = dir.join("bigfile.000");
+        // A sparse file, so the test writes no data of this size.
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_FILELIST_BYTES + 1)
+            .unwrap();
+        let err = HashDictionary::new().load_file(&path).unwrap_err();
+        assert!(
+            matches!(&err, FilelistError::TooLarge { path: p, limit } if *p == path && *limit == MAX_FILELIST_BYTES),
+            "{err:?}"
+        );
     }
 }

@@ -69,8 +69,29 @@ pub(super) struct SelectionResult<'a> {
 struct PlannedRelItem<'a> {
     archive_rank: usize,
     entry: &'a Entry,
-    rel_path: PathBuf,
-    rel_key: String,
+    rel: RelPath,
+}
+
+/// A relative output path and its comparison key ([`normalized_rel_key`]), built together by
+/// [`RelPath::new`]. Replace a `RelPath` whole rather than editing its fields, so the key keeps
+/// matching the path.
+struct RelPath {
+    path: PathBuf,
+    key: String,
+}
+
+impl RelPath {
+    /// Pairs `path` with its comparison key.
+    fn new(path: PathBuf) -> Self {
+        let key = normalized_rel_key(&path);
+        Self { path, key }
+    }
+}
+
+/// The first free candidate [`first_free_rel_path`] found, and the occurrence number that made it.
+struct FreeRelPath {
+    occurrence: usize,
+    rel: RelPath,
 }
 
 pub(super) struct PlannedExtraction<'a> {
@@ -125,15 +146,15 @@ impl<'a> SelectionResult<'a> {
         chosen: &[&'a Entry],
         dict: &HashDictionary,
     ) {
-        let (base_rel, is_resolved) = dict.relative_path_or_fallback(run[0].name_hash);
+        let output = dict.relative_path_or_fallback(run[0].name_hash);
         self.skipped_entries += run.len() - chosen.len();
         let total_for_hash = chosen.len();
         self.selected
             .extend(chosen.iter().map(|&entry| SelectedCandidate {
                 archive_rank,
                 entry,
-                base_rel: base_rel.clone(),
-                is_resolved,
+                base_rel: output.path.clone(),
+                is_resolved: output.resolved,
                 total_for_hash,
             }));
     }
@@ -165,28 +186,26 @@ fn select_entries_from_run<'a>(
 }
 
 /// Tries the output paths `candidate(n)` for `n = first, first + 1, ...` and returns the first
-/// `n` whose comparison key `is_taken` does not reject, with that path and key.
+/// whose comparison key `is_taken` does not reject.
 fn first_free_rel_path(
     first: usize,
     candidate: impl Fn(usize) -> PathBuf,
     is_taken: impl Fn(&str) -> bool,
-) -> (usize, PathBuf, String) {
-    let mut n = first;
+) -> FreeRelPath {
+    let mut occurrence = first;
     loop {
-        let rel = candidate(n);
-        let key = normalized_rel_key(&rel);
-        if !is_taken(&key) {
-            return (n, rel, key);
+        let rel = RelPath::new(candidate(occurrence));
+        if !is_taken(&rel.key) {
+            return FreeRelPath { occurrence, rel };
         }
-        n += 1;
+        occurrence += 1;
     }
 }
 
-/// Relative output paths claimed for the selected records, with the comparison key of every
-/// claimed path mapped to the next `.v{N}` occurrence to try when another record wants it.
+/// Relative output paths claimed for the selected records.
 struct RelativePlan<'a> {
     items: Vec<PlannedRelItem<'a>>,
-    used_rel_keys: HashMap<String, usize>,
+    claimed: ClaimedPaths,
 }
 
 impl<'a> RelativePlan<'a> {
@@ -195,18 +214,54 @@ impl<'a> RelativePlan<'a> {
         let count = selection.selected.len();
         let mut plan = Self {
             items: Vec::with_capacity(count),
-            used_rel_keys: HashMap::with_capacity(count),
+            claimed: ClaimedPaths::with_capacity(count),
         };
         for candidate in &selection.selected {
-            let (rel_path, rel_key) = plan.claim_variant_path(candidate, layout);
+            let rel = plan.claimed.claim_variant_path(candidate, layout);
             plan.items.push(PlannedRelItem {
                 archive_rank: candidate.archive_rank,
                 entry: candidate.entry,
-                rel_path,
-                rel_key,
+                rel,
             });
         }
         plan
+    }
+
+    /// Ensures no planned output file path collides with any ancestor directory of another
+    /// planned file, renaming such files with `.file` (or `.file.v{N}`).
+    fn resolve_file_dir_collisions(&mut self) {
+        let dir_keys = collect_ancestor_dir_keys(&self.items);
+        if dir_keys.is_empty() {
+            return;
+        }
+        for item in &mut self.items {
+            if dir_keys.contains(&item.rel.key) {
+                item.rel = self
+                    .claimed
+                    .claim_file_path_beside_dir(&item.rel.path, &dir_keys);
+            }
+        }
+    }
+}
+
+/// The comparison key of every claimed relative output path, mapped to the next `.v{N}`
+/// occurrence to try when another record wants that path.
+struct ClaimedPaths {
+    next_occurrence: HashMap<String, usize>,
+}
+
+impl ClaimedPaths {
+    /// An empty set with room for `count` paths.
+    fn with_capacity(count: usize) -> Self {
+        Self {
+            next_occurrence: HashMap::with_capacity(count),
+        }
+    }
+
+    /// Records `rel` as claimed, with `.v1` as the next occurrence to try for it, and returns it.
+    fn claim(&mut self, rel: RelPath) -> RelPath {
+        self.next_occurrence.insert(rel.key.clone(), 1);
+        rel
     }
 
     /// Claims a unique case-insensitive relative output path for `candidate`, disambiguating
@@ -215,7 +270,7 @@ impl<'a> RelativePlan<'a> {
         &mut self,
         candidate: &SelectedCandidate<'_>,
         layout: VariantLayout,
-    ) -> (PathBuf, String) {
+    ) -> RelPath {
         let disambiguate = needs_spec_disambiguation(layout, candidate.total_for_hash);
         let spec_flags = candidate.entry.spec_flags;
         let candidate_path = |occurrence| {
@@ -227,35 +282,33 @@ impl<'a> RelativePlan<'a> {
                 occurrence,
             )
         };
-        let initial_rel = candidate_path(0);
-        let initial_key = normalized_rel_key(&initial_rel);
-        let Some(&next_occurrence) = self.used_rel_keys.get(&initial_key) else {
-            self.used_rel_keys.insert(initial_key.clone(), 1);
-            return (initial_rel, initial_key);
+        let initial = RelPath::new(candidate_path(0));
+        let Some(&next_occurrence) = self.next_occurrence.get(&initial.key) else {
+            return self.claim(initial);
         };
-        let (occurrence, rel, key) = first_free_rel_path(next_occurrence, candidate_path, |key| {
-            self.used_rel_keys.contains_key(key)
+        let free = first_free_rel_path(next_occurrence, candidate_path, |key| {
+            self.next_occurrence.contains_key(key)
         });
-        self.used_rel_keys.insert(initial_key, occurrence + 1);
-        self.used_rel_keys.insert(key.clone(), 1);
-        (rel, key)
+        self.next_occurrence
+            .insert(initial.key, free.occurrence + 1);
+        self.claim(free.rel)
     }
 
-    /// Ensures no planned output file path collides with any ancestor directory of another
-    /// planned file, renaming such files with `.file` (or `.file.v{N}`).
-    fn resolve_file_dir_collisions(&mut self) {
-        let dir_keys = collect_ancestor_dir_keys(&self.items);
-        if dir_keys.is_empty() {
-            return;
-        }
-        for item in &mut self.items {
-            if dir_keys.contains(&item.rel_key) {
-                let (new_rel, new_key) =
-                    claim_file_path_beside_dir(&item.rel_path, &dir_keys, &mut self.used_rel_keys);
-                item.rel_path = new_rel;
-                item.rel_key = new_key;
-            }
-        }
+    /// Claims `rel_path` with `.file` (or `.file.v{N}`) appended to its stem, for a file path that
+    /// collides with one of the ancestor directory keys `dir_keys`.
+    fn claim_file_path_beside_dir(
+        &mut self,
+        rel_path: &Path,
+        dir_keys: &HashSet<String>,
+    ) -> RelPath {
+        let candidate = |n| match n {
+            0 => append_stem_suffix(rel_path, ".file"),
+            n => append_stem_suffix(rel_path, &format!(".file.v{n}")),
+        };
+        let free = first_free_rel_path(0, candidate, |key| {
+            dir_keys.contains(key) || self.next_occurrence.contains_key(key)
+        });
+        self.claim(free.rel)
     }
 }
 
@@ -274,7 +327,7 @@ pub(super) fn build_extraction_plan<'a>(
         .map(|item| PlannedExtraction {
             archive_rank: item.archive_rank,
             entry: item.entry,
-            dest_path: out_dir.join(item.rel_path),
+            dest_path: out_dir.join(item.rel.path),
         })
         .collect();
 
@@ -299,11 +352,11 @@ pub(super) fn build_extraction_plan<'a>(
 }
 
 /// Collects normalized case-insensitive relative keys for all ancestor directories of `rel_items`
-/// by slicing the already-normalized `'/'`-separated `item.rel_key`.
+/// by slicing the already-normalized `'/'`-separated `item.rel.key`.
 fn collect_ancestor_dir_keys(rel_items: &[PlannedRelItem<'_>]) -> HashSet<String> {
     let mut dir_keys = HashSet::new();
     for item in rel_items {
-        let mut slice = item.rel_key.as_str();
+        let mut slice = item.rel.key.as_str();
         while let Some(slash_idx) = slice.rfind('/') {
             slice = &slice[..slash_idx];
             if slice.is_empty() || dir_keys.contains(slice) {
@@ -313,24 +366,6 @@ fn collect_ancestor_dir_keys(rel_items: &[PlannedRelItem<'_>]) -> HashSet<String
         }
     }
     dir_keys
-}
-
-/// Claims `rel_path` with `.file` (or `.file.v{N}`) appended to its stem, for a file path that
-/// collides with an ancestor directory key.
-fn claim_file_path_beside_dir(
-    rel_path: &Path,
-    dir_keys: &HashSet<String>,
-    used_rel_keys: &mut HashMap<String, usize>,
-) -> (PathBuf, String) {
-    let candidate = |n| match n {
-        0 => append_stem_suffix(rel_path, ".file"),
-        n => append_stem_suffix(rel_path, &format!(".file.v{n}")),
-    };
-    let (_, rel, key) = first_free_rel_path(0, candidate, |key| {
-        dir_keys.contains(key) || used_rel_keys.contains_key(key)
-    });
-    used_rel_keys.insert(key.clone(), 1);
-    (rel, key)
 }
 
 /// Collects all unique parent directories across the finalized extraction items.

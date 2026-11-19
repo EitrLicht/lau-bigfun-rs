@@ -1,6 +1,6 @@
 [package]
 name = "lau-bigfun"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Tomb Raider LAU (Legend, Anniversary, Underworld) bigfile archive reader and unpacker"
@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/EitrLicht/lau-bigfun-rs"
 keywords = ["tomb-raider", "bigfile", "archive", "unpacker", "modding"]
 categories = ["command-line-utilities", "game-development", "parser-implementations"]
-include = ["/src/**", "/tests/**", "/README.md", "/LICENSE", "/SECURITY.md"]
+include = ["/src/**", "/tests/**", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
 
 [lib]
 name = "lau_bigfun"
@@ -47,3 +47,7 @@ missing_docs = "warn"
 [lints.clippy]
 must_use_candidate = "warn"
 missing_errors_doc = "warn"
+# AGENTS.md's defensive-parsing rule: no silently truncating or sign-changing casts.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"

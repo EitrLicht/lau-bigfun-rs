@@ -55,7 +55,7 @@ To use only the library, turn off the default `cli` feature so the CLI's depende
 cargo add lau-bigfun --no-default-features
 ```
 
-Before 0.4.0 the crate had no features, so `default-features = false` changed nothing. From 0.4.0 it also turns off `filter` and `unpack`: if your `Cargo.toml` already sets it and you use either module, add `features = ["unpack"]`.
+[CHANGELOG.md](CHANGELOG.md) lists the changes in each release, with the steps to take when upgrading across a breaking one.
 
 ## Filelists
 
@@ -115,7 +115,7 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 | `info <ARCHIVE>` | Display archive metadata, part geometry, hash resolution coverage, and specialisation flag breakdown. |
 | `list <ARCHIVE>` | List and filter Table of Contents (FAT) entries (`-l` / `--limit <N>`, default `50`; `0` = unlimited). When the limit hides entries, a note on `stderr` says how many matched. |
 | `extract <ARCHIVE> <TARGET>` | Extract a single entry by path or `0x<hash:08x>` to `-o <FILE>` or `stdout` (`--variant <N>` selects the 0-based index among `--spec-mask` matches; with neither it nor `--engine-spec-match`, it takes the first and, when several match, says how to choose). A failed read keeps an existing `<FILE>`; on `stdout` it can leave partial output and exits non-zero. |
-| `unpack <ARCHIVE> -o <DIR>` | Unpack all or filtered entries across worker threads (`-j` / `--jobs <N>`, default `0` = auto-detect cores). |
+| `unpack <ARCHIVE> -o <DIR>` | Unpack all or filtered entries across worker threads (`-j` / `--jobs <N>`, default `0` = auto-detect cores, at most 64). |
 | `hash <PATH>...` | Compute the 32-bit `CRC-32/BZIP2` hash for one or more asset paths. |
 
 ### Archive & Dictionary Options (`info`, `list`, `extract`, `unpack`)
@@ -125,7 +125,7 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 | `--endian <auto\|little\|big>` | TOC byte order (aliases `le`, `be`; default `auto`). Auto-detects `little` (PC/PS2/PSP/Xbox) vs. `big` (PS3/Xbox 360/Wii) from FAT and part geometry, or enforces the specified order strictly. |
 | `--segment-length <BYTES>` | Virtual segment stride in hex or decimal (e.g. `0x7ff00000` or `0x09600000`). Auto-detected from 1 MiB-aligned multi-part spill boundaries when omitted. A given value is used only if it is 1 MiB-aligned and every part file and record fits it. |
 | `--single-part` | Open exactly the given file as one archive: no gathering of numbered `.000`, `.001`, ... parts and no `.dat` name resolution. For games whose numbered files are separate archives, each with its own TOC (e.g. `PATCH.000` and `PATCH.001`). Takes a file, not a directory; conflicts with `--segment-length`. |
-| `--filelist <FILE>` | Load a UTF-8 or Latin-1 filename list with one asset path per line, written as the game hashes it (e.g. `pc-w\lara.drm`). Blank lines and lines starting with `#` are ignored. Repeatable, and later lists override earlier ones on a matching hash. See [Filelists](#filelists) for what each command does without one. |
+| `--filelist <FILE>` | Load a UTF-8 or Latin-1 filename list with one asset path per line, written as the game hashes it (e.g. `pc-w\lara.drm`). Blank lines and lines starting with `#` are ignored, and a file over 64 MiB is rejected. Repeatable, and later lists override earlier ones on a matching hash. See [Filelists](#filelists) for what each command does without one. |
 
 ### Filtering & Extraction Options
 
@@ -141,9 +141,11 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 | `--variant-layout <MODE>` | `unpack` | Disambiguate colliding specialisation variants via `spec-dir` (default, `spec_<hex>/` when ambiguous), `always-spec-dir`, or `suffix` (`.spec_<hex>`). |
 | `--raw` | `extract`, `unpack` | Write raw on-disk bytes without inflating `zlib`-compressed payloads. |
 | `--max-output-bytes <BYTES>` | `unpack` | Refuse to start if the planned output exceeds this many bytes (hex or decimal; `0` for no limit). Defaults to 16 times the size of the archive on disk, since records can share stored bytes and expand far beyond it. This bounds expansion; free disk space is not checked. |
-| `--dry-run` | `unpack` | Report the files and bytes the unpack would write, without writing anything. The count is bytes written, not the disk space their blocks take up, and a planned output over `--max-output-bytes` is reported with a warning instead of refused. The destination is not checked, so a real unpack can still fail to create or write it. |
+| `--dry-run` | `unpack` | Report the files and bytes the unpack would write, without writing anything. The count is bytes written, not the disk space their blocks take up, and a planned output over `--max-output-bytes` is reported with a warning instead of refused. The destination is not checked, so a real unpack can still fail to create or write it, except that a destination that is a part file of the archive being read fails the dry run too. |
 
 `unpack` follows symbolic links already inside the output directory, except that a link to a directory on another filesystem fails, because files are moved into place from under the output directory.
+
+On Windows, an archive's parts cannot be written to or renamed while `lau-bigfun` has them open, and an archive that another program is writing, such as a game update in progress, will not open until it finishes.
 
 ### Global Options
 
@@ -166,7 +168,7 @@ The oracle tests in `tests/lau_oracle_integration.rs` check the library against 
 | *Anniversary* | `LAU_BIGFUN_TRA_TEST_ARCHIVE_DIR` | `LAU_BIGFUN_TRA_TEST_FILELIST` |
 | *Underworld* | `LAU_BIGFUN_TRU_TEST_ARCHIVE_DIR` | `LAU_BIGFUN_TRU_TEST_FILELIST` |
 
-Within that run, checks for an unset variable are skipped. An archive variable needs its filelist variable set too, and a set variable whose path is missing or invalid fails the tests instead of skipping them.
+Within that run, checks for an unset variable are skipped; set `LAU_BIGFUN_REQUIRE_ORACLES=1` to make an unset variable fail them instead, so a run cannot pass without checking anything. An archive variable needs its filelist variable set too, and a set variable whose path is missing or invalid fails the tests instead of skipping them.
 
 Parsers of untrusted input are fuzzed with `cargo-fuzz` on the nightly toolchain. The targets are `fat_parse`, `archive_read`, `filelist_load`, `sanitize_path`, and `glob_filter`:
 

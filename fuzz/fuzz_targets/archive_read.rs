@@ -10,7 +10,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use lau_bigfun::{ArchiveSet, Bigfile, Entry, OpenOptions};
+use lau_bigfun::{ArchiveSet, Bigfile, BigfileError, Entry, OpenOptions};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_PARTS: usize = 3;
@@ -44,7 +44,11 @@ fn write_parts(dir: &Path, data: &[u8]) -> Option<()> {
 
 /// Reads `entry` through [`Bigfile::open_entry`] in reads of [`STREAM_STEP`] bytes.
 fn read_streamed(bf: &Bigfile, entry: &Entry, raw: bool) -> Option<Vec<u8>> {
-    let mut reader = bf.open_entry(entry, raw).ok()?;
+    read_in_steps(bf.open_entry(entry, raw).ok()?)
+}
+
+/// Reads `reader` to its end in reads of [`STREAM_STEP`] bytes.
+fn read_in_steps(mut reader: impl Read) -> Option<Vec<u8>> {
     let (mut out, mut buf) = (Vec::new(), [0u8; STREAM_STEP]);
     loop {
         match reader.read(&mut buf).ok()? {
@@ -61,10 +65,27 @@ fn check_streamed_read(bf: &Bigfile, entry: &Entry, raw: bool) -> Option<Vec<u8>
     whole
 }
 
+/// Reads of `entry` through [`Bigfile::open_entry_at`] must return the tail of its stored bytes
+/// `stored` from each offset up to their end, and opening past their end must fail.
+fn check_reads_from_offsets(bf: &Bigfile, entry: &Entry, stored: &[u8]) {
+    let inside = entry.name_hash as usize % (stored.len() + 1);
+    for offset in [0, inside, stored.len()] {
+        let reader = bf.open_entry_at(entry, offset as u64).unwrap();
+        assert_eq!(read_in_steps(reader).as_deref(), Some(&stored[offset..]));
+    }
+    let past_end = bf.open_entry_at(entry, stored.len() as u64 + 1);
+    assert!(matches!(
+        past_end,
+        Err(BigfileError::OffsetPastEntryEnd { .. })
+    ));
+}
+
 fn read_entries(bf: &Bigfile) {
     let mut chunk = Vec::new();
     for entry in bf.entries().iter().take(MAX_ENTRIES) {
-        check_streamed_read(bf, entry, true);
+        if let Some(stored) = check_streamed_read(bf, entry, true) {
+            check_reads_from_offsets(bf, entry, &stored);
+        }
         let inflated = check_streamed_read(bf, entry, false);
         let copied = bf.read_entry_into(entry, false, &mut chunk, &mut io::sink());
         assert_eq!(copied.ok(), inflated.map(|bytes| bytes.len() as u64));

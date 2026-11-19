@@ -44,8 +44,8 @@ fn compute_archive_stats(bf: &Bigfile, dict: &HashDictionary) -> ArchiveStats {
         if e.is_compressed() {
             compressed_count += 1;
         }
-        total_logical_bytes += e.size as u64;
-        total_stored_bytes += e.stored_size() as u64;
+        total_logical_bytes += u64::from(e.size);
+        total_stored_bytes += u64::from(e.stored_size());
     }
 
     ArchiveStats {

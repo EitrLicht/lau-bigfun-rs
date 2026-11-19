@@ -1,6 +1,6 @@
 //! Virtual segment detection and volume geometry validation.
 
-use super::{Bigfile, BigfileError};
+use super::{Bigfile, BigfileError, EntryLocation};
 use crate::fat::Entry;
 use crate::format::{BLOCK_BYTE_COUNT, SECTOR_BYTE_COUNT, is_block_aligned};
 
@@ -116,7 +116,7 @@ impl Bigfile {
             });
         }
 
-        self.locate_validated_coords(entry)?;
+        self.stored_span(entry)?;
         Ok(())
     }
 
@@ -154,7 +154,11 @@ impl Bigfile {
     fn validate_multipart_start_sectors(&self, segment_length: u64) -> Result<(), BigfileError> {
         let mut has_part_start = vec![false; self.part_sizes.len()];
         for entry in self.fat.entries() {
-            if let Ok((part_index, 0)) = self.locate_coords(entry) {
+            if let Ok(EntryLocation {
+                part_index,
+                offset_in_part: 0,
+            }) = self.locate(entry)
+            {
                 has_part_start[part_index] = true;
             }
         }

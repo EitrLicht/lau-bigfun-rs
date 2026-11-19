@@ -66,6 +66,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`Bigfile::open_entry_at`] opens an entry's stored bytes from an offset instead, so several
+//! threads can each read their own part of one entry.
 
 // Docs of always-built items link to `filter` and `unpack` items. The default build, which CI
 // checks with broken links denied, resolves every link; without `unpack` those links render as
@@ -83,20 +86,77 @@ pub mod path;
 #[cfg(feature = "unpack")]
 pub mod unpack;
 
-pub use archive::{ArchiveSet, Bigfile, BigfileError, EntryReader, OpenOptions, ResolvedEntry};
+pub use archive::{
+    ArchiveSet, Bigfile, BigfileError, EntryLocation, EntryReader, OpenOptions, ResolvedEntry,
+};
 pub use fat::{Entry, Fat, FatError};
-pub use filelist::{FilelistError, HashDictionary};
+pub use filelist::{FilelistError, HashDictionary, RelativeOutputPath};
 #[cfg(feature = "unpack")]
 pub use filter::{EntryFilter, FilterError};
 pub use format::{Endian, HexLabel};
 pub use hash::{NonLatin1CharError, name_hash, name_hash_bytes};
 #[cfg(feature = "unpack")]
 pub use unpack::{
-    UnpackOptions, UnpackReport, VariantLayout, extract_entry, unpack_archive, unpack_archive_set,
+    MAX_UNPACK_JOBS, UnpackOptions, UnpackReport, VariantLayout, extract_entry, unpack_archive,
+    unpack_archive_set,
 };
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// Checks that [`FilelistError`], [`NonLatin1CharError`], [`RelativeOutputPath`] and
+/// [`EntryLocation`] stay `#[non_exhaustive]`, as samples of the public types that carry it: each
+/// example compiles only without the attribute. `BigfileError` and `FatError` are not checked,
+/// since a match on all their variants would go stale. Update the [`FilelistError`] match when a
+/// variant is added: a match that misses one fails to compile with the attribute removed too, so
+/// the check would stop working.
+#[cfg(doctest)]
+mod non_exhaustive_guards {
+    /// A `match` on every [`FilelistError`](crate::FilelistError) variant still needs a wildcard
+    /// arm outside the crate.
+    ///
+    /// ```compile_fail,E0004
+    /// use lau_bigfun::FilelistError;
+    ///
+    /// fn line(err: &FilelistError) -> Option<usize> {
+    ///     match err {
+    ///         FilelistError::Io { .. } | FilelistError::TooLarge { .. } => None,
+    ///         FilelistError::InvalidFilename { line, .. } => Some(*line),
+    ///     }
+    /// }
+    /// ```
+    struct FilelistErrorMatch;
+
+    /// [`NonLatin1CharError`](crate::NonLatin1CharError) cannot be built with a struct literal
+    /// outside the crate.
+    ///
+    /// ```compile_fail,E0639
+    /// let _ = lau_bigfun::NonLatin1CharError { ch: 'ā', byte_offset: 0 };
+    /// ```
+    struct NonLatin1CharErrorLiteral;
+
+    /// [`RelativeOutputPath`](crate::RelativeOutputPath) cannot be built with a struct literal
+    /// outside the crate.
+    ///
+    /// ```compile_fail,E0639
+    /// let _ = lau_bigfun::RelativeOutputPath {
+    ///     path: std::path::PathBuf::from("pc-w/lara.drm"),
+    ///     resolved: true,
+    /// };
+    /// ```
+    struct RelativeOutputPathLiteral;
+
+    /// [`EntryLocation`](crate::EntryLocation) cannot be built with a struct literal outside the
+    /// crate.
+    ///
+    /// ```compile_fail,E0639
+    /// let _ = lau_bigfun::EntryLocation {
+    ///     part_index: 0,
+    ///     offset_in_part: 0,
+    /// };
+    /// ```
+    struct EntryLocationLiteral;
+}
 
 #[cfg(test)]
 mod tests {
@@ -127,7 +187,7 @@ mod tests {
                 name_hash(LARA_PATH).unwrap(),
                 0xFFFF_FFFF,
                 &z_lara,
-                RAW_LARA.len() as u32,
+                u32::try_from(RAW_LARA.len()).unwrap(),
             ),
         ];
         write_archive(dir.join("bigfile.000"), Endian::Little, &records);
@@ -188,11 +248,17 @@ mod tests {
     #[test]
     fn detects_custom_block_aligned_segment_stride() {
         let dir = create_one_block_stride_archive("custom_stride", SECTOR_BYTE_COUNT as usize);
-        let stride_bytes = BLOCK_BYTE_COUNT as u64;
+        let stride_bytes = u64::from(BLOCK_BYTE_COUNT);
 
         let bf = Bigfile::open(&dir).unwrap();
         assert_eq!(bf.segment_length(), Some(stride_bytes));
-        assert_eq!(bf.locate_coords(&bf.entries()[1]).unwrap(), (1, 0));
+        assert_eq!(
+            bf.locate(&bf.entries()[1]).unwrap(),
+            EntryLocation {
+                part_index: 1,
+                offset_in_part: 0
+            }
+        );
 
         let bf_dat = Bigfile::open(dir.join("BIGFILE.DAT")).unwrap();
         assert_eq!(bf_dat.segment_length(), Some(stride_bytes));
@@ -213,7 +279,7 @@ mod tests {
     fn rejects_segment_length_not_matching_detected_stride() {
         let dir = create_one_block_stride_archive("stride_mismatch", SECTOR_BYTE_COUNT as usize);
         let opts = OpenOptions {
-            segment_length: Some((BLOCK_BYTE_COUNT as u64) * 2),
+            segment_length: Some(u64::from(BLOCK_BYTE_COUNT) * 2),
             endian: None,
             single_part: false,
         };

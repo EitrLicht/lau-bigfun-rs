@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{Bigfile, BigfileError};
-use crate::path::parent_dir;
+use crate::path::{FileId, parent_dir};
 
 /// Bundle of discovered physical archive part files and metadata.
 pub(super) struct DiscoveredParts {
@@ -14,6 +14,7 @@ pub(super) struct DiscoveredParts {
     pub(super) part_paths: Vec<PathBuf>,
     pub(super) part_files: Vec<File>,
     pub(super) part_sizes: Vec<u64>,
+    pub(super) part_ids: Vec<FileId>,
 }
 
 /// Cached regular-file directory entry with precomputed ASCII-lowercased filename.
@@ -128,7 +129,7 @@ impl Bigfile {
             return Err(BigfileError::NoPartsFound(target.path.to_path_buf()));
         }
 
-        let (part_files, part_sizes) = open_part_files(&part_paths)?;
+        let opened = open_part_files(&part_paths)?;
         let actual_stem = part_paths[0]
             .file_stem()
             .and_then(|s| s.to_str())
@@ -139,8 +140,9 @@ impl Bigfile {
             dir_path: target.dir,
             stem: actual_stem,
             part_paths,
-            part_files,
-            part_sizes,
+            part_files: opened.files,
+            part_sizes: opened.sizes,
+            part_ids: opened.ids,
         })
     }
 }
@@ -159,15 +161,26 @@ fn is_dat_extension(ext: &str) -> bool {
 
 /// Reads regular-file directory entries sorted by `(name_lower, name)` for deterministic
 /// case-insensitive matching across all filesystems without per-probe `stat` syscalls.
+///
+/// A folder that does not exist has no entries. Any other failure to list it, including one
+/// partway through the listing, fails with [`BigfileError::ArchiveDirectory`], so a part is never
+/// silently left out of the archive.
 fn read_sorted_dir_entries(dir_path: &Path) -> Result<Vec<DirFileEntry>, BigfileError> {
-    let rd = match fs::read_dir(dir_path) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(BigfileError::Io(e)),
+    let listing_error = |source| BigfileError::ArchiveDirectory {
+        path: dir_path.to_path_buf(),
+        source,
     };
+    let listing = match fs::read_dir(dir_path) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(listing_error(source)),
+    };
+    let listed = listing
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(listing_error)?;
 
-    let mut entries: Vec<DirFileEntry> = rd
-        .filter_map(Result::ok)
+    let mut entries: Vec<DirFileEntry> = listed
+        .into_iter()
         .filter(|e| {
             e.file_type()
                 .is_ok_and(|ft| ft.is_file() || (ft.is_symlink() && e.path().is_file()))
@@ -241,17 +254,81 @@ fn find_named_file(target: &Path, dir_entries: &[DirFileEntry]) -> Option<PathBu
         .or_else(|| target.is_file().then(|| target.to_path_buf()))
 }
 
-/// Opens all discovered part files and queries their physical byte lengths.
-fn open_part_files(part_paths: &[PathBuf]) -> io::Result<(Vec<File>, Vec<u64>)> {
-    let mut part_files = Vec::with_capacity(part_paths.len());
-    let mut part_sizes = Vec::with_capacity(part_paths.len());
-    for path in part_paths {
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        part_files.push(file);
-        part_sizes.push(size);
+/// The open part files of an archive, with the byte length and identity of each. Identities are
+/// only taken when the `unpack` feature, the only reader of them, is built; otherwise `ids` is
+/// empty.
+struct OpenedParts {
+    files: Vec<File>,
+    sizes: Vec<u64>,
+    ids: Vec<FileId>,
+}
+
+/// Share mode for opening part files on Windows: other handles may read a part, but not write to
+/// it or rename it while the archive is open. `std` would also share writing and deletion.
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+/// Opens the part file at `path` for reading. On Windows it shares only reading, so nothing can
+/// write to the part or rename it while the archive is open, and opening fails if another handle
+/// already has the part open for writing. Unix has no equivalent.
+///
+/// Renaming another file over the part's own name is refused too, but not over a second hard
+/// link to it, which only unlinks that name and leaves the part's data in place. For the part's
+/// own name, the destination check in `extract` and `unpack` refuses the output before anything
+/// is staged, rather than leaving a failed rename partway through an extraction.
+fn open_part(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(FILE_SHARE_READ);
     }
-    Ok((part_files, part_sizes))
+    options.open(path)
+}
+
+/// Hint for a part that could not be opened because another program holds it: on Windows, a
+/// sharing violation (OS error 32) means a handle that may write the part is open. Empty for any
+/// other failure.
+pub(super) fn sharing_hint(err: &io::Error) -> &'static str {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    if cfg!(windows) && err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        "; another program has it open for writing, so close that program or wait for it to finish"
+    } else {
+        ""
+    }
+}
+
+/// Opens all discovered part files and records each one's physical byte length and, with the
+/// `unpack` feature, its identity, failing with [`BigfileError::PartOpen`] naming the first part
+/// that cannot be.
+fn open_part_files(part_paths: &[PathBuf]) -> Result<OpenedParts, BigfileError> {
+    let id_count = if cfg!(feature = "unpack") {
+        part_paths.len()
+    } else {
+        0
+    };
+    let mut opened = OpenedParts {
+        files: Vec::with_capacity(part_paths.len()),
+        sizes: Vec::with_capacity(part_paths.len()),
+        ids: Vec::with_capacity(id_count),
+    };
+    for path in part_paths {
+        let part_error = |source| BigfileError::PartOpen {
+            path: path.clone(),
+            source,
+        };
+        let file = open_part(path).map_err(part_error)?;
+        let meta = file.metadata().map_err(part_error)?;
+        opened.sizes.push(meta.len());
+        // On Windows an identity costs a file open per part, so it is skipped where nothing uses it.
+        if cfg!(feature = "unpack") {
+            let id = FileId::from_metadata(&meta, path).map_err(part_error)?;
+            opened.ids.push(id);
+        }
+        opened.files.push(file);
+    }
+    Ok(opened)
 }
 
 /// File name of part `index` of the archive named `stem`: `<stem>.000`, `<stem>.001`, ...
@@ -263,6 +340,46 @@ pub(super) fn part_file_name(stem: &str, index: u32) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{TempDir, write_one_empty_record};
+
+    #[test]
+    fn opening_a_part_that_fails_names_the_part() {
+        let dir = TempDir::new("part_open_fails");
+        let missing = dir.join("bigfile.000");
+
+        let err = open_part_files(std::slice::from_ref(&missing))
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(&err, BigfileError::PartOpen { path, .. } if *path == missing),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn opening_a_part_whose_folder_cannot_be_listed_names_the_folder() {
+        let dir = TempDir::new("list_fails");
+        let not_a_folder = dir.join("notadir");
+        write_one_empty_record(&not_a_folder);
+
+        let err = Bigfile::open(not_a_folder.join("bigfile.000")).unwrap_err();
+
+        assert!(
+            matches!(&err, BigfileError::ArchiveDirectory { path, .. } if *path == not_a_folder),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn other_open_failures_get_no_sharing_hint() {
+        assert_eq!(sharing_hint(&io::ErrorKind::NotFound.into()), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_violation_gets_a_hint() {
+        assert!(!sharing_hint(&io::Error::from_raw_os_error(32)).is_empty());
+    }
 
     #[test]
     fn target_resolution_isolates_numbered_parts_from_other_files() {

@@ -10,8 +10,12 @@ mod execute;
 mod plan;
 
 pub use execute::extract_entry;
-use execute::{create_parent_directories, extract_items};
+use execute::{ArchiveParts, create_parent_directories, extract_items};
 use plan::{build_extraction_plan, planned_output_bytes, select_archive_entries};
+
+/// Most worker threads an unpack starts, however many [`UnpackOptions::jobs`] asks for. Each holds
+/// a chunk buffer of up to 1 MiB, so this also bounds those buffers to 64 MiB.
+pub const MAX_UNPACK_JOBS: usize = 64;
 
 /// Policy for laying out files when multiple FAT records share the same `name_hash`: its
 /// specialisation variants.
@@ -46,6 +50,8 @@ pub struct UnpackOptions {
     /// Optional entry filter (substring, glob set, or unresolved) matched against each entry.
     pub filter: Option<EntryFilter>,
     /// Number of parallel worker threads (`0` = auto-detect available CPU parallelism, `1` = single-threaded).
+    /// At most [`MAX_UNPACK_JOBS`] start, however many are requested, and fewer if the system
+    /// cannot start them.
     ///
     /// Each worker streams entries through one reusable chunk buffer of at most 1 MiB
     /// (`O(jobs * 1 MiB)` peak buffer memory, independent of entry size).
@@ -58,7 +64,9 @@ pub struct UnpackOptions {
     /// `out_dir`. The report counts what an unpack with the same options would write, and
     /// [`max_output_bytes`](Self::max_output_bytes) is not enforced, so a planned output over the
     /// limit is still reported. The destination is not checked: a dry run succeeds even where a
-    /// real unpack could not create or write `out_dir`, or would run out of disk space.
+    /// real unpack could not create or write `out_dir`, or would run out of disk space. The one
+    /// exception is a destination that reaches a part file of the archive being read, which fails
+    /// as it would on a real unpack.
     pub dry_run: bool,
 }
 
@@ -116,6 +124,8 @@ pub struct UnpackReport {
 ///
 /// - [`BigfileError::OutputLimitExceeded`] before anything is written, when the planned output is
 ///   larger than [`UnpackOptions::max_output_bytes`] and this is not a dry run.
+/// - [`BigfileError::OutputIsArchivePart`] before anything is written, when a destination reaches
+///   a part file of the archive being read, on a dry run too.
 /// - [`BigfileError::OutputPath`] when an output directory or file cannot be created, written or
 ///   moved into place.
 /// - Any error reading an entry, as [`Bigfile::read_entry`] describes.
@@ -153,6 +163,10 @@ pub fn unpack_archive_set(
     let selection = select_archive_entries(set, dict, options);
     let plan = build_extraction_plan(&selection, out_dir, options.variant_layout);
     let planned = planned_output_bytes(&plan.items, options.raw);
+    let parts = ArchiveParts::of(archives);
+    for item in &plan.items {
+        parts.check(&item.dest_path)?;
+    }
     let extracted_bytes = if options.dry_run {
         planned
     } else {
@@ -202,7 +216,7 @@ mod tests {
                 h(r"pc-w\alpha.drm"),
                 1,
                 &alpha_z,
-                ALPHA_INFLATED.len() as u32,
+                u32::try_from(ALPHA_INFLATED.len()).unwrap(),
             ),
             ArchiveRecord::stored(h(r"pc-w\alpha.drm"), 3, b"alpha_spec3_raw"),
             ArchiveRecord::stored(h(r"pc-w\beta.drm"), 1, b"beta_payload"),
@@ -591,6 +605,156 @@ mod tests {
 
         assert!(unpack_with_jobs(&bf, &out_dir, 1).is_err());
         assert_eq!(fs::read(&existing).unwrap(), b"previous run");
+    }
+
+    /// Whether `err` refuses to write over an archive part at `path`.
+    fn refuses_archive_part(err: &BigfileError, path: &Path) -> bool {
+        matches!(err, BigfileError::OutputIsArchivePart { path: refused } if refused == path)
+    }
+
+    /// Writes and opens `bigfile.000` in `tmp` holding two entries a filelist names
+    /// `bigfile.000`, like the archive itself, and `newdir/a.bin`, so unpacking into `tmp`
+    /// would replace the archive.
+    fn open_self_named_archive(tmp: &TempDir) -> (Bigfile, HashDictionary) {
+        let names = ["bigfile.000", "newdir/a.bin"];
+        let mut hashes = names.map(|name| name_hash(name).unwrap());
+        hashes.sort_unstable();
+        let records = hashes.map(|hash| ArchiveRecord::stored(hash, 1, b"payload"));
+        write_archive(tmp.join("bigfile.000"), Endian::Little, &records);
+        let mut dict = HashDictionary::new();
+        dict.load_str(&names.join("\n")).unwrap();
+        (Bigfile::open(tmp.join("bigfile.000")).unwrap(), dict)
+    }
+
+    #[test]
+    fn unpack_refuses_to_overwrite_an_archive_part() {
+        let tmp = TempDir::new("unpack_over_part");
+        let (bf, dict) = open_self_named_archive(&tmp);
+        let part = tmp.join("bigfile.000");
+        let before = fs::read(&part).unwrap();
+
+        let err = unpack_archive(&bf, &dict, &tmp, &UnpackOptions::default()).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &part), "{err:?}");
+        assert_eq!(fs::read(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn unpack_refusal_creates_no_folders() {
+        let tmp = TempDir::new("unpack_refusal_no_dirs");
+        let (bf, dict) = open_self_named_archive(&tmp);
+
+        unpack_archive(&bf, &dict, &tmp, &UnpackOptions::default()).unwrap_err();
+
+        assert!(!tmp.join("newdir").exists());
+    }
+
+    #[test]
+    fn dry_run_refuses_a_destination_over_the_archive() {
+        let tmp = TempDir::new("dry_run_over_part");
+        let (bf, dict) = open_self_named_archive(&tmp);
+
+        let err = unpack_archive(&bf, &dict, &tmp, &dry_run_options()).unwrap_err();
+
+        assert!(
+            refuses_archive_part(&err, &tmp.join("bigfile.000")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_entry_refuses_to_overwrite_an_archive_part() {
+        let tmp = TempDir::new("extract_over_part");
+        let bf = open_unnamed_record_archive(&tmp);
+        let part = tmp.join("bigfile.000");
+        let before = fs::read(&part).unwrap();
+
+        let err = extract_entry(&bf, &bf.entries()[0], false, &part).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &part), "{err:?}");
+        assert_eq!(fs::read(&part).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_entry_refuses_a_symlink_to_an_archive_part() {
+        let tmp = TempDir::new("extract_link_to_part");
+        let bf = open_unnamed_record_archive(&tmp);
+        let (part, link) = (tmp.join("bigfile.000"), tmp.join("out.bin"));
+        std::os::unix::fs::symlink(&part, &link).unwrap();
+        let before = fs::read(&part).unwrap();
+
+        let err = extract_entry(&bf, &bf.entries()[0], false, &link).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &link), "{err:?}");
+        assert_eq!(fs::read(&part).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_entry_refuses_a_hard_link_to_an_archive_part() {
+        let tmp = TempDir::new("extract_hard_link_to_part");
+        let bf = open_unnamed_record_archive(&tmp);
+        let (part, link) = (tmp.join("bigfile.000"), tmp.join("out.bin"));
+        fs::hard_link(&part, &link).unwrap();
+        let before = fs::read(&part).unwrap();
+
+        let err = extract_entry(&bf, &bf.entries()[0], false, &link).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &link), "{err:?}");
+        assert_eq!(fs::read(&part).unwrap(), before);
+    }
+
+    // On Windows an open part cannot be renamed (`open_part_cannot_be_renamed`), so this case only
+    // arises on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn extract_entry_refuses_a_part_renamed_after_opening() {
+        let tmp = TempDir::new("extract_renamed_part");
+        let bf = open_unnamed_record_archive(&tmp);
+        let moved = tmp.join("moved.000");
+        fs::rename(tmp.join("bigfile.000"), &moved).unwrap();
+        let before = fs::read(&moved).unwrap();
+
+        let err = extract_entry(&bf, &bf.entries()[0], false, &moved).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &moved), "{err:?}");
+        assert_eq!(fs::read(&moved).unwrap(), before);
+    }
+
+    // On Windows the path check cannot see a hard link, and the share mode does not stop a rename
+    // from replacing one: the rename swaps only the link's directory entry, so the part keeps its
+    // data. (On Unix the check refuses the link outright.)
+    #[cfg(windows)]
+    #[test]
+    fn extract_entry_onto_a_hard_link_leaves_the_part_intact() {
+        let tmp = TempDir::new("extract_hard_link_windows");
+        let (part, link) = (tmp.join("bigfile.000"), tmp.join("out.bin"));
+        let record = ArchiveRecord::stored(0xDEAD_BEEF, 1, b"payload");
+        write_archive(&part, Endian::Little, &[record]);
+        fs::hard_link(&part, &link).unwrap();
+        let bf = Bigfile::open(&part).unwrap();
+        let before = fs::read(&part).unwrap();
+
+        extract_entry(&bf, &bf.entries()[0], false, &link).unwrap();
+
+        assert_eq!(fs::read(&link).unwrap(), b"payload");
+        assert_eq!(fs::read(&part).unwrap(), before);
+        assert_eq!(bf.read_entry(&bf.entries()[0], false).unwrap(), b"payload");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extract_entry_refuses_a_part_named_in_another_case() {
+        let tmp = TempDir::new("extract_part_other_case");
+        let bf = open_unnamed_record_archive(&tmp);
+        let other_case = tmp.join("BIGFILE.000");
+        let before = fs::read(tmp.join("bigfile.000")).unwrap();
+
+        let err = extract_entry(&bf, &bf.entries()[0], false, &other_case).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &other_case), "{err:?}");
+        assert_eq!(fs::read(tmp.join("bigfile.000")).unwrap(), before);
     }
 
     #[test]

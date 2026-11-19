@@ -19,22 +19,19 @@ fn matching_list_entries<'a>(
         if filter.is_some_and(|f| !f.matches(entry.name_hash, name)) {
             return None;
         }
-        Some(
-            bf.locate_coords(entry)
-                .map(|(part_index, offset_in_part)| ListEntryRecord {
-                    index: entry.index,
-                    name_hash: HexU32(entry.name_hash),
-                    name,
-                    size: entry.size,
-                    stored_size: entry.stored_size(),
-                    deflated_size: entry.deflated_size,
-                    compressed: entry.is_compressed(),
-                    sector_number: entry.sector_number,
-                    part_index,
-                    offset_in_part,
-                    spec_flags: HexU32(entry.spec_flags),
-                }),
-        )
+        Some(bf.locate(entry).map(|location| ListEntryRecord {
+            index: entry.index,
+            name_hash: HexU32(entry.name_hash),
+            name,
+            size: entry.size,
+            stored_size: entry.stored_size(),
+            deflated_size: entry.deflated_size,
+            compressed: entry.is_compressed(),
+            sector_number: entry.sector_number,
+            part_index: location.part_index,
+            offset_in_part: location.offset_in_part,
+            spec_flags: HexU32(entry.spec_flags),
+        }))
     })
 }
 

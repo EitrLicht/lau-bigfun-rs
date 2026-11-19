@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::fat::{Entry, Fat, FatError};
+use crate::fat::{BothFailed, Detected, Entry, FailedAttempt, Fat, FatError};
 use crate::format::{Endian, HexLabel};
+use crate::path::FileId;
 
 mod discovery;
 mod geometry;
@@ -25,10 +26,33 @@ pub use set::{ArchiveSet, ResolvedEntry};
 /// Variants about one record name it by its position in the FAT (`index`), its path hash
 /// (`name_hash`) and, where relevant, its starting sector (`sector_number`), as in [`Entry`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BigfileError {
     /// Reading the archive, its directory or an input file failed.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The folder that holds the archive's parts could not be listed, such as for lack of
+    /// permission.
+    #[error("cannot list archive folder '{path}': {source}")]
+    ArchiveDirectory {
+        /// Path of the folder.
+        path: PathBuf,
+        /// The failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A part file could not be opened, or its size or identity read. On Windows this includes a
+    /// part that another program has open for writing.
+    #[error("cannot open archive part '{path}': {source}{}", discovery::sharing_hint(.source))]
+    PartOpen {
+        /// Path of the part file.
+        path: PathBuf,
+        /// The failure.
+        #[source]
+        source: io::Error,
+    },
 
     /// The destination rejected extracted bytes, as opposed to a failure reading the archive.
     #[error("failed to write output: {0}")]
@@ -53,6 +77,15 @@ pub enum BigfileError {
         planned: u64,
         /// The configured limit.
         limit: u64,
+    },
+
+    /// An unpack or extraction would write over a part file of an archive it reads, through the
+    /// destination `path` (which may be a link to the part). Nothing is written. Only unpacking
+    /// (feature `unpack`) returns this.
+    #[error("refusing to write to '{path}': it is a part file of the archive being read")]
+    OutputIsArchivePart {
+        /// The destination that names the archive part.
+        path: PathBuf,
     },
 
     /// The FAT failed to parse or validate.
@@ -165,6 +198,21 @@ pub enum BigfileError {
         physical_size: u64,
     },
 
+    /// [`Bigfile::open_entry_at`] was asked to start past the end of a record's stored bytes.
+    #[error(
+        "offset {offset} is past the end of record {index} (hash {}), which stores {stored_size} bytes", HexLabel::new(*.name_hash)
+    )]
+    OffsetPastEntryEnd {
+        /// Position of the record in the FAT.
+        index: usize,
+        /// Path hash of the record.
+        name_hash: u32,
+        /// The requested offset into the record's stored bytes.
+        offset: u64,
+        /// Stored bytes the record holds.
+        stored_size: u32,
+    },
+
     /// A record with stored bytes starts inside the FAT at the start of part 0.
     #[error(
         "record {index} (hash {}) at sector {sector_number} (offset {logical_offset:#x}) overlaps the FAT header ({fat_byte_size:#x} bytes)", HexLabel::new(*.name_hash)
@@ -225,6 +273,19 @@ pub enum BigfileError {
     },
 }
 
+/// Where an entry's stored bytes start, as [`Bigfile::locate`] finds it.
+///
+/// Locations order by part, then by offset, which is the order of the bytes on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct EntryLocation {
+    /// Index of the part file holding the entry, as in [`Bigfile::part_paths`].
+    pub part_index: usize,
+    /// Byte offset of the entry's stored bytes within that part. Not checked against the part's
+    /// size (see [`Bigfile::locate`]).
+    pub offset_in_part: u64,
+}
+
 /// Configuration options for opening and validating a [`Bigfile`] archive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenOptions {
@@ -247,6 +308,10 @@ pub struct OpenOptions {
 /// Keeps open [`File`] handles for all physical part files (`.000`, `.001`, ...) and reads them
 /// with positional I/O (`pread` / `seek_read`), which takes the offset with each read, so threads
 /// share the handles without per-entry `open()`/`close()` calls or coordinated seeks.
+///
+/// On Windows the parts are opened sharing only reading: while a `Bigfile` is open, no other
+/// handle can write to its parts or rename them, and opening fails if one already has a part open
+/// for writing.
 #[derive(Debug)]
 pub struct Bigfile {
     /// Base directory containing the archive part files.
@@ -264,6 +329,9 @@ pub struct Bigfile {
     part_files: Vec<File>,
     /// Physical byte size of each part file in `part_paths`.
     part_sizes: Vec<u64>,
+    /// Identity of each part file in `part_paths`, taken when it was opened. Empty without the
+    /// `unpack` feature, which alone reads it.
+    part_ids: Vec<FileId>,
 }
 
 /// The FAT bytes read from part 0 so far: the 4-byte header, then as much of the body as the
@@ -318,6 +386,20 @@ impl Opening {
     }
 }
 
+/// An archive opened in one byte order, with the FAT bytes read so far, which checking the other
+/// byte order for ambiguity reuses.
+struct Opened {
+    bigfile: Bigfile,
+    fat_bytes: FatBytes,
+}
+
+/// The part holding an entry and the byte range of its stored bytes in that part, checked to lie
+/// within the part file.
+struct StoredSpan {
+    part_index: usize,
+    range: Range<u64>,
+}
+
 /// Why one byte order failed while opening an archive.
 enum EndianError {
     /// The FAT did not parse in that byte order.
@@ -334,11 +416,15 @@ impl EndianError {
     }
 
     /// The error to report when both byte orders fail: the first geometry error, since that order's
-    /// FAT at least parsed, or else the first byte order's error.
-    fn reported(first: Self, second: Self) -> BigfileError {
-        match (first, second) {
-            (Self::Fat(_), Self::Geometry(err)) => err,
-            (first, _) => first.into_error(),
+    /// FAT at least parsed, or else the preferred byte order's error. The preferred order is the
+    /// one tried first.
+    fn reported(both: BothFailed<Self>) -> BigfileError {
+        match both {
+            BothFailed {
+                preferred: Self::Fat(_),
+                other: Self::Geometry(err),
+            } => err,
+            BothFailed { preferred, .. } => preferred.into_error(),
         }
     }
 }
@@ -362,7 +448,10 @@ impl Bigfile {
     /// # Errors
     ///
     /// - [`BigfileError::NoPartsFound`] when `path` names no archive.
-    /// - [`BigfileError::Io`] when the parts or their directory cannot be read.
+    /// - [`BigfileError::PartOpen`] when a part file cannot be opened, or its size or identity
+    ///   read, such as on Windows when another program has it open for writing.
+    /// - [`BigfileError::ArchiveDirectory`] when the folder holding the parts cannot be listed.
+    /// - [`BigfileError::Io`] when reading the parts fails.
     /// - [`BigfileError::Fat`] when the FAT does not parse.
     /// - [`BigfileError::AmbiguousEndian`] when no byte order is given and the archive is valid
     ///   in both.
@@ -381,17 +470,22 @@ impl Bigfile {
         let open_as = |opening, endian| Self::open_as(opening, endian, segment_length);
         if let Some(endian) = options.endian {
             return open_as(opening, endian)
-                .map(|(bf, _)| bf)
-                .map_err(|(_, err)| err.into_error());
+                .map(|opened| opened.bigfile)
+                .map_err(|failed| failed.error.into_error());
         }
-        match Fat::try_auto_endian(opening.fat_bytes.header, opening, open_as) {
-            Ok(((mut bf, mut fat_bytes), Some(other))) => {
-                bf.reject_ambiguous(other, &mut fat_bytes, segment_length)?;
-                Ok(bf)
-            }
-            Ok(((bf, _), None)) => Ok(bf),
-            Err((first, second)) => Err(EndianError::reported(first, second)),
+        let Detected {
+            value:
+                Opened {
+                    mut bigfile,
+                    mut fat_bytes,
+                },
+            untried,
+        } = Fat::try_auto_endian(opening.fat_bytes.header, opening, open_as)
+            .map_err(EndianError::reported)?;
+        if let Some(other) = untried {
+            bigfile.reject_ambiguous(other, &mut fat_bytes, segment_length)?;
         }
+        Ok(bigfile)
     }
 
     /// Opens the archive in `endian` byte order: parses the FAT, then validates the volume
@@ -401,23 +495,28 @@ impl Bigfile {
         mut opening: Box<Opening>,
         endian: Endian,
         segment_length_override: Option<u64>,
-    ) -> Result<(Self, FatBytes), (Box<Opening>, EndianError)> {
+    ) -> Result<Opened, FailedAttempt<Box<Opening>, EndianError>> {
         let (part0, part0_size) = (&opening.parts.part_files[0], opening.parts.part_sizes[0]);
         let fat = match opening.fat_bytes.parse(part0, part0_size, endian) {
             Ok(fat) => fat,
-            Err(err) => return Err((opening, EndianError::Fat(err))),
+            Err(err) => {
+                return Err(FailedAttempt {
+                    state: opening,
+                    error: EndianError::Fat(err),
+                });
+            }
         };
         let Opening { parts, fat_bytes } = *opening;
-        let mut bf = Self::from_parts(parts, fat);
-        match bf.validate_volume_geometry(segment_length_override) {
-            Ok(()) => Ok((bf, fat_bytes)),
-            Err(err) => {
-                let opening = Box::new(Opening {
-                    parts: bf.into_parts(),
+        let mut bigfile = Self::from_parts(parts, fat);
+        match bigfile.validate_volume_geometry(segment_length_override) {
+            Ok(()) => Ok(Opened { bigfile, fat_bytes }),
+            Err(err) => Err(FailedAttempt {
+                state: Box::new(Opening {
+                    parts: bigfile.into_parts(),
                     fat_bytes,
-                });
-                Err((opening, EndianError::Geometry(err)))
-            }
+                }),
+                error: EndianError::Geometry(err),
+            }),
         }
     }
 
@@ -460,6 +559,7 @@ impl Bigfile {
             part_paths: parts.part_paths,
             part_files: parts.part_files,
             part_sizes: parts.part_sizes,
+            part_ids: parts.part_ids,
         }
     }
 
@@ -471,6 +571,7 @@ impl Bigfile {
             part_paths: self.part_paths,
             part_files: self.part_files,
             part_sizes: self.part_sizes,
+            part_ids: self.part_ids,
         }
     }
 
@@ -539,40 +640,59 @@ impl Bigfile {
         &self.part_sizes
     }
 
-    /// Returns the part index and the byte offset within that part where `entry` is stored.
+    /// Identity of each part file, taken when it was opened, so a destination can be checked
+    /// against the files actually being read.
+    #[cfg(feature = "unpack")]
+    #[inline]
+    #[must_use]
+    pub(crate) fn part_ids(&self) -> &[FileId] {
+        &self.part_ids
+    }
+
+    /// Returns the part holding `entry` and the byte offset within that part where its stored
+    /// bytes start.
+    ///
+    /// The offset is not checked against the part's size. Opening the archive checked that each of
+    /// its own entries fits its part, but an [`Entry`] from another archive can lie past the end.
     ///
     /// # Errors
     ///
     /// [`BigfileError::PartOutOfRange`] when `entry` would start past the last part.
     #[inline]
-    pub fn locate_coords(&self, entry: &Entry) -> Result<(usize, u64), BigfileError> {
+    pub fn locate(&self, entry: &Entry) -> Result<EntryLocation, BigfileError> {
         let logical = entry.logical_offset();
-        let (part_index, offset_in_part) = match self.segment_length {
-            Some(stride) => (
-                usize::try_from(logical / stride).unwrap_or(usize::MAX),
-                logical % stride,
-            ),
-            None => (0, logical),
+        let location = match self.segment_length {
+            Some(stride) => EntryLocation {
+                part_index: usize::try_from(logical / stride).unwrap_or(usize::MAX),
+                offset_in_part: logical % stride,
+            },
+            None => EntryLocation {
+                part_index: 0,
+                offset_in_part: logical,
+            },
         };
 
-        if part_index >= self.part_paths.len() {
+        if location.part_index >= self.part_paths.len() {
             return Err(BigfileError::PartOutOfRange {
                 index: entry.index,
                 name_hash: entry.name_hash,
                 sector_number: entry.sector_number,
-                part_index,
+                part_index: location.part_index,
                 part_count: self.part_paths.len(),
             });
         }
 
-        Ok((part_index, offset_in_part))
+        Ok(location)
     }
 
     /// Returns the part holding `entry` and the byte range of its stored bytes in that part,
     /// verifying that the range lies within the part file.
     #[inline]
-    fn locate_validated_coords(&self, entry: &Entry) -> Result<(usize, Range<u64>), BigfileError> {
-        let (part_index, offset_in_part) = self.locate_coords(entry)?;
+    fn stored_span(&self, entry: &Entry) -> Result<StoredSpan, BigfileError> {
+        let EntryLocation {
+            part_index,
+            offset_in_part,
+        } = self.locate(entry)?;
         let stored_size = entry.stored_size();
         let physical_size = self.part_sizes[part_index];
         let end = offset_in_part.saturating_add(u64::from(stored_size));
@@ -588,7 +708,10 @@ impl Bigfile {
                 physical_size,
             });
         }
-        Ok((part_index, offset_in_part..end))
+        Ok(StoredSpan {
+            part_index,
+            range: offset_in_part..end,
+        })
     }
 
     /// Streams `entry`'s payload into `out` through the caller's reusable `chunk` buffer (at most
@@ -639,10 +762,60 @@ impl Bigfile {
     /// [`BigfileError::PartOutOfRange`] or [`BigfileError::RecordOverrunsPart`] when `entry` lies
     /// outside the archive's parts.
     pub fn open_entry(&self, entry: &Entry, raw: bool) -> Result<EntryReader<'_>, BigfileError> {
-        let (part_index, range) = self.locate_validated_coords(entry)?;
-        let stored =
-            PositionalFileReader::new(&self.part_files[part_index], range.start, range.end);
+        let stored = self.stored_reader(entry, 0)?;
         Ok(EntryReader::new(*entry, raw, stored))
+    }
+
+    /// Opens `entry`'s stored bytes from `offset` to their end as a stream, never inflating them.
+    /// `offset` counts stored bytes, so for a compressed entry it is a position in its zlib
+    /// stream.
+    ///
+    /// Bytes from the middle of a zlib stream cannot be inflated on their own, so to read a
+    /// compressed entry's content (see [`Entry::is_compressed`]), use [`Self::open_entry`] or
+    /// [`Self::read_entry`], which inflate from the start. Starting at an offset suits
+    /// uncompressed entries, whose stored bytes are their content, and raw copies of compressed
+    /// ones.
+    ///
+    /// Readers keep no shared cursor, so several readers of one entry, on one thread or many,
+    /// can each start where they need. `offset == entry.stored_size()` opens an empty reader. A
+    /// read fails like one from [`Self::open_entry`] where the part file ends early.
+    ///
+    /// # Errors
+    ///
+    /// [`BigfileError::PartOutOfRange`] or [`BigfileError::RecordOverrunsPart`] when `entry` lies
+    /// outside the archive's parts, and [`BigfileError::OffsetPastEntryEnd`] when `offset` is
+    /// past `entry.stored_size()`.
+    pub fn open_entry_at(
+        &self,
+        entry: &Entry,
+        offset: u64,
+    ) -> Result<EntryReader<'_>, BigfileError> {
+        let stored = self.stored_reader(entry, offset)?;
+        Ok(EntryReader::new(*entry, true, stored))
+    }
+
+    /// Reader over `entry`'s stored bytes from `offset` within them to their end.
+    fn stored_reader(
+        &self,
+        entry: &Entry,
+        offset: u64,
+    ) -> Result<PositionalFileReader<'_>, BigfileError> {
+        let StoredSpan { part_index, range } = self.stored_span(entry)?;
+        let start = range
+            .start
+            .checked_add(offset)
+            .filter(|&start| start <= range.end)
+            .ok_or(BigfileError::OffsetPastEntryEnd {
+                index: entry.index,
+                name_hash: entry.name_hash,
+                offset,
+                stored_size: entry.stored_size(),
+            })?;
+        Ok(PositionalFileReader::new(
+            &self.part_files[part_index],
+            start,
+            range.end,
+        ))
     }
 
     /// Returns all entries matching `name_hash` (all specialisation variants).
@@ -669,8 +842,38 @@ mod tests {
     use crate::format::{BLOCK_BYTE_COUNT, FAT_ENTRY_BYTES, SECTOR_BYTE_COUNT};
     use crate::test_support::{
         ArchiveRecord, TempDir, build_ambiguous_part0, build_part0_bytes, write_archive,
-        write_one_empty_record, write_one_record_archives, write_part0,
+        write_one_empty_record, write_one_record_archives, write_part0, write_two_part_archive,
     };
+
+    #[cfg(not(feature = "unpack"))]
+    #[test]
+    fn part_identities_are_not_captured_without_unpack() {
+        let dir = TempDir::new("no_part_ids");
+        write_one_empty_record(dir.join("bigfile.000"));
+        let bf = Bigfile::open(dir.join("bigfile.000")).unwrap();
+        assert!(bf.part_ids.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_part_cannot_be_renamed() {
+        let dir = TempDir::new("part_no_rename");
+        write_one_empty_record(dir.join("bigfile.000"));
+        let _bf = Bigfile::open(dir.join("bigfile.000")).unwrap();
+        assert!(fs::rename(dir.join("bigfile.000"), dir.join("moved.000")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_part_cannot_be_opened_for_writing() {
+        let dir = TempDir::new("part_no_write");
+        write_one_empty_record(dir.join("bigfile.000"));
+        let _bf = Bigfile::open(dir.join("bigfile.000")).unwrap();
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("bigfile.000"));
+        assert!(writer.is_err());
+    }
 
     #[test]
     fn open_finds_numbered_parts_named_in_another_case() {
@@ -756,7 +959,7 @@ mod tests {
         let dir = TempDir::new("unaligned_err");
         write_one_empty_record(dir.join("bigfile.000"));
 
-        for bad_stride in [0u64, 2048, (BLOCK_BYTE_COUNT as u64) + 2048] {
+        for bad_stride in [0u64, 2048, u64::from(BLOCK_BYTE_COUNT) + 2048] {
             let err = Bigfile::open_with_options(
                 &dir,
                 OpenOptions {
@@ -798,14 +1001,14 @@ mod tests {
         write_empty_record_at_part0_end(&dir);
 
         let bf = Bigfile::open(&dir).unwrap();
-        assert_eq!(bf.segment_length(), Some(2 * BLOCK_BYTE_COUNT as u64));
+        assert_eq!(bf.segment_length(), Some(2 * u64::from(BLOCK_BYTE_COUNT)));
     }
 
     #[test]
     fn explicit_segment_length_opens_when_an_empty_record_ends_part0() {
         let dir = TempDir::new("empty_at_part0_end_override");
         write_empty_record_at_part0_end(&dir);
-        let stride = 2 * BLOCK_BYTE_COUNT as u64;
+        let stride = 2 * u64::from(BLOCK_BYTE_COUNT);
 
         let options = OpenOptions {
             segment_length: Some(stride),
@@ -820,7 +1023,7 @@ mod tests {
     fn explicit_segment_length_the_records_do_not_fit_is_rejected() {
         let dir = TempDir::new("override_does_not_fit");
         write_empty_record_at_part0_end(&dir);
-        let block = BLOCK_BYTE_COUNT as u64;
+        let block = u64::from(BLOCK_BYTE_COUNT);
 
         let options = OpenOptions {
             segment_length: Some(block),
@@ -874,7 +1077,7 @@ mod tests {
     fn explicit_segment_length_that_fits_overrides_the_detected_one() {
         let dir = TempDir::new("override_fits");
         write_part1_starting_with_empty_record(&dir);
-        let stride = 2 * BLOCK_BYTE_COUNT as u64;
+        let stride = 2 * u64::from(BLOCK_BYTE_COUNT);
 
         let options = OpenOptions {
             segment_length: Some(stride),
@@ -903,7 +1106,7 @@ mod tests {
             Bigfile::open_with_options(
                 &dir,
                 OpenOptions {
-                    segment_length: Some(BLOCK_BYTE_COUNT as u64),
+                    segment_length: Some(u64::from(BLOCK_BYTE_COUNT)),
                     endian: None,
                     single_part: false,
                 },
@@ -915,6 +1118,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn entry_locations_sort_in_disk_order() {
+        let at = |part_index, offset_in_part| EntryLocation {
+            part_index,
+            offset_in_part,
+        };
+        let mut locations = [at(1, 0), at(0, 4096), at(0, 2048)];
+        locations.sort();
+        assert_eq!(locations, [at(0, 2048), at(0, 4096), at(1, 0)]);
+    }
+
+    #[test]
+    fn locates_record_at_the_start_of_a_later_part() {
+        let dir = TempDir::new("two_part_locate");
+        let part0 = [ArchiveRecord::stored(0x1, 1, b"in part 0")];
+        let part1 = [ArchiveRecord::stored(0x2, 1, b"in part 1")];
+        write_two_part_archive(&dir, &part0, &part1);
+        let bf = Bigfile::open(&dir).unwrap();
+        assert_eq!(
+            bf.locate(&bf.find(0x2)[0]).unwrap(),
+            EntryLocation {
+                part_index: 1,
+                offset_in_part: 0
+            }
+        );
     }
 
     #[test]
@@ -931,7 +1161,7 @@ mod tests {
         let err = Bigfile::open_with_options(
             &dir,
             OpenOptions {
-                segment_length: Some(BLOCK_BYTE_COUNT as u64),
+                segment_length: Some(u64::from(BLOCK_BYTE_COUNT)),
                 endian: None,
                 single_part: false,
             },
@@ -968,33 +1198,51 @@ mod tests {
         let matches = bf.find(0x5FF9_1900);
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            bf.locate_coords(&matches[0]).unwrap(),
-            (0, SECTOR_BYTE_COUNT as u64)
+            bf.locate(&matches[0]).unwrap(),
+            EntryLocation {
+                part_index: 0,
+                offset_in_part: u64::from(SECTOR_BYTE_COUNT)
+            }
         );
         assert!(bf.read_entry(&matches[0], false).unwrap().is_empty());
+    }
+
+    /// An empty record at sector 10, past the end of the two-sector archive
+    /// [`create_monolithic_dat`] writes.
+    const RECORD_PAST_END: Entry = Entry {
+        index: 99,
+        name_hash: 0xDEAD_BEEF,
+        size: 0,
+        sector_number: 10,
+        spec_flags: 1,
+        deflated_size: 0,
+    };
+
+    fn is_record_past_end_overrun(err: &BigfileError) -> bool {
+        matches!(
+            err,
+            BigfileError::RecordOverrunsPart {
+                index: 99,
+                needed: 0,
+                ..
+            }
+        )
     }
 
     #[test]
     fn read_entry_rejects_record_past_the_end_of_its_part() {
         let dir = create_monolithic_dat("record_past_end");
         let bf = Bigfile::open(&dir).unwrap();
+        let err = bf.read_entry(&RECORD_PAST_END, true).unwrap_err();
+        assert!(is_record_past_end_overrun(&err), "{err:?}");
+    }
 
-        let oob_entry = Entry {
-            index: 99,
-            name_hash: 0xDEAD_BEEF,
-            size: 0,
-            sector_number: 10,
-            spec_flags: 1,
-            deflated_size: 0,
-        };
-        assert!(matches!(
-            bf.read_entry(&oob_entry, true).unwrap_err(),
-            BigfileError::RecordOverrunsPart {
-                index: 99,
-                needed: 0,
-                ..
-            }
-        ));
+    #[test]
+    fn open_entry_at_reports_record_overrun_before_offset() {
+        let dir = create_monolithic_dat("at_record_past_end");
+        let bf = Bigfile::open(&dir).unwrap();
+        let err = bf.open_entry_at(&RECORD_PAST_END, 1).unwrap_err();
+        assert!(is_record_past_end_overrun(&err), "{err:?}");
     }
 
     const BIG_ENDIAN_PAYLOAD: &[u8] = b"big-endian PS3/X360 payload";
@@ -1064,12 +1312,9 @@ mod tests {
         assert_eq!(bf.entries().len(), 0x0001_0000);
     }
 
-    /// Distinct errors to tell apart in [`EndianError::reported`] tests.
-    fn endian_errors() -> (BigfileError, BigfileError) {
-        (
-            BigfileError::NoPartsFound(PathBuf::from("first")),
-            BigfileError::NoPartsFound(PathBuf::from("second")),
-        )
+    /// An error carrying `path`, so [`EndianError::reported`] tests can tell which one it chose.
+    fn named(path: &str) -> BigfileError {
+        BigfileError::NoPartsFound(PathBuf::from(path))
     }
 
     fn names(err: &BigfileError, path: &str) -> bool {
@@ -1077,32 +1322,39 @@ mod tests {
     }
 
     #[test]
-    fn reports_geometry_error_over_an_earlier_fat_error() {
-        let (first, second) = endian_errors();
-        let err = EndianError::reported(EndianError::Fat(first), EndianError::Geometry(second));
-        assert!(names(&err, "second"));
+    fn reports_other_geometry_error_over_a_preferred_fat_error() {
+        let err = EndianError::reported(BothFailed {
+            preferred: EndianError::Fat(named("preferred")),
+            other: EndianError::Geometry(named("other")),
+        });
+        assert!(names(&err, "other"));
     }
 
     #[test]
-    fn reports_first_geometry_error_over_a_later_one() {
-        let (first, second) = endian_errors();
-        let err =
-            EndianError::reported(EndianError::Geometry(first), EndianError::Geometry(second));
-        assert!(names(&err, "first"));
+    fn reports_preferred_geometry_error_over_the_other_one() {
+        let err = EndianError::reported(BothFailed {
+            preferred: EndianError::Geometry(named("preferred")),
+            other: EndianError::Geometry(named("other")),
+        });
+        assert!(names(&err, "preferred"));
     }
 
     #[test]
-    fn reports_first_geometry_error_over_a_later_fat_error() {
-        let (first, second) = endian_errors();
-        let err = EndianError::reported(EndianError::Geometry(first), EndianError::Fat(second));
-        assert!(names(&err, "first"));
+    fn reports_preferred_geometry_error_over_an_other_fat_error() {
+        let err = EndianError::reported(BothFailed {
+            preferred: EndianError::Geometry(named("preferred")),
+            other: EndianError::Fat(named("other")),
+        });
+        assert!(names(&err, "preferred"));
     }
 
     #[test]
-    fn reports_first_fat_error_when_both_fats_fail() {
-        let (first, second) = endian_errors();
-        let err = EndianError::reported(EndianError::Fat(first), EndianError::Fat(second));
-        assert!(names(&err, "first"));
+    fn reports_preferred_fat_error_when_both_fats_fail() {
+        let err = EndianError::reported(BothFailed {
+            preferred: EndianError::Fat(named("preferred")),
+            other: EndianError::Fat(named("other")),
+        });
+        assert!(names(&err, "preferred"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub const CRC32_BZIP2_INIT: u32 = 0xFFFF_FFFF;
     "filename contains non-Latin-1 character {ch:?} (U+{:04X}) at byte offset {byte_offset}",
     u32::from(*.ch)
 )]
+#[non_exhaustive]
 pub struct NonLatin1CharError {
     /// The character outside Latin-1.
     pub ch: char,
@@ -33,9 +34,9 @@ pub struct NonLatin1CharError {
 /// Precomputed 256-entry MSB-first `CRC-32/BZIP2` lookup table.
 const CRC32_BZIP2_TABLE: [u32; 256] = {
     let mut table = [0u32; 256];
-    let mut i = 0;
+    let mut i: u32 = 0;
     while i < 256 {
-        let mut crc = (i as u32) << 24;
+        let mut crc = i << 24;
         let mut bit = 0;
         while bit < 8 {
             if (crc & 0x8000_0000) != 0 {
@@ -45,7 +46,7 @@ const CRC32_BZIP2_TABLE: [u32; 256] = {
             }
             bit += 1;
         }
-        table[i] = crc;
+        table[i as usize] = crc;
         i += 1;
     }
     table

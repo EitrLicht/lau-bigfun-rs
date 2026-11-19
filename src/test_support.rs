@@ -14,7 +14,9 @@ use flate2::write::ZlibEncoder;
 
 use crate::archive::{Bigfile, OpenOptions};
 use crate::fat::Entry;
-use crate::format::{Endian, SECTOR_BYTE_COUNT, fat_byte_len, sector_logical_offset};
+use crate::format::{
+    BLOCK_SECTOR_COUNT, Endian, SECTOR_BYTE_COUNT, fat_byte_len, sector_logical_offset,
+};
 
 /// One record for [`write_archive`]: its TOC fields and the bytes stored for it.
 #[derive(Clone, Copy)]
@@ -29,12 +31,12 @@ pub(crate) struct ArchiveRecord<'a> {
 
 impl<'a> ArchiveRecord<'a> {
     /// Record whose `payload` is stored as it is.
-    pub(crate) const fn stored(hash: u32, spec_flags: u32, payload: &'a [u8]) -> Self {
+    pub(crate) fn stored(hash: u32, spec_flags: u32, payload: &'a [u8]) -> Self {
         Self {
             hash,
             spec_flags,
             payload,
-            size: payload.len() as u32,
+            size: u32::try_from(payload.len()).unwrap(),
             compressed: false,
         }
     }
@@ -57,9 +59,9 @@ impl<'a> ArchiveRecord<'a> {
     }
 
     /// The record's `(name_hash, size, sector_number, spec_flags, deflated_size)` TOC fields.
-    const fn toc_fields(&self, sector: u32) -> (u32, u32, u32, u32, i32) {
+    fn toc_fields(&self, sector: u32) -> (u32, u32, u32, u32, i32) {
         let deflated = if self.compressed {
-            self.payload.len() as i32
+            i32::try_from(self.payload.len()).unwrap()
         } else {
             0
         };
@@ -134,7 +136,7 @@ const fn encode_u32(endian: Endian, value: u32) -> [u8; 4] {
 /// byte order from `(name_hash, size, sector_number, spec_flags, deflated_size)` tuples.
 pub(crate) fn build_fat_bytes(endian: Endian, records: &[(u32, u32, u32, u32, i32)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(fat_byte_len(records.len()).unwrap());
-    buf.extend_from_slice(&encode_u32(endian, records.len() as u32));
+    buf.extend_from_slice(&encode_u32(endian, u32::try_from(records.len()).unwrap()));
     for &(hash, _, _, _, _) in records {
         buf.extend_from_slice(&encode_u32(endian, hash));
     }
@@ -142,7 +144,7 @@ pub(crate) fn build_fat_bytes(endian: Endian, records: &[(u32, u32, u32, u32, i3
         buf.extend_from_slice(&encode_u32(endian, size));
         buf.extend_from_slice(&encode_u32(endian, sector));
         buf.extend_from_slice(&encode_u32(endian, spec));
-        buf.extend_from_slice(&encode_u32(endian, deflated as u32));
+        buf.extend_from_slice(&encode_u32(endian, deflated.cast_unsigned()));
     }
     buf
 }
@@ -197,16 +199,90 @@ pub(crate) const fn sample_entry(index: usize, name_hash: u32, sector: u32, spec
 /// Writes a single-part archive in `endian` byte order from `records`, in the order given (sorted
 /// by hash), each payload in its own sectors after the FAT.
 pub(crate) fn write_archive(path: impl AsRef<Path>, endian: Endian, records: &[ArchiveRecord<'_>]) {
-    let fat_len = fat_byte_len(records.len()).unwrap();
-    let mut next_sector = sector_count(fat_len as u32).max(1);
-    let mut fat_records = Vec::with_capacity(records.len());
-    let mut payloads = Vec::with_capacity(records.len());
-    for record in records {
-        fat_records.push(record.toc_fields(next_sector));
-        payloads.push((next_sector, record.payload));
-        next_sector += sector_count(record.payload.len() as u32);
+    let layout = RecordLayout::new(records, first_payload_sector(records.len()));
+    write_part0(
+        path,
+        endian,
+        layout.end_sector,
+        &layout.toc,
+        &layout.payloads,
+    );
+}
+
+/// Writes a little-endian archive with a 1 MiB segment length under `dir`: `bigfile.000` holds
+/// `part0` after the FAT and `bigfile.001` holds `part1` from its first byte. Hashes must be
+/// sorted across both slices, `part0` before `part1`, and `part1` must start with a record holding
+/// data, from which opening detects the segment length.
+pub(crate) fn write_two_part_archive(
+    dir: &Path,
+    part0: &[ArchiveRecord<'_>],
+    part1: &[ArchiveRecord<'_>],
+) {
+    assert!(
+        part0
+            .iter()
+            .chain(part1)
+            .is_sorted_by_key(|record| record.hash),
+        "hashes must be sorted across both parts"
+    );
+    assert!(
+        part1
+            .first()
+            .is_some_and(|record| !record.payload.is_empty()),
+        "part 1 must start with a record holding data"
+    );
+    let first = RecordLayout::new(part0, first_payload_sector(part0.len() + part1.len()));
+    let second = RecordLayout::new(part1, BLOCK_SECTOR_COUNT);
+    assert!(
+        first.end_sector <= BLOCK_SECTOR_COUNT,
+        "part 0 overflows its segment"
+    );
+    let toc: Vec<_> = first.toc.iter().chain(&second.toc).copied().collect();
+    let part0_path = dir.join("bigfile.000");
+    write_part0(
+        part0_path,
+        Endian::Little,
+        first.end_sector,
+        &toc,
+        &first.payloads,
+    );
+
+    let part1_sectors = second.end_sector - BLOCK_SECTOR_COUNT;
+    let mut part1_bytes = vec![0u8; usize::try_from(sector_logical_offset(part1_sectors)).unwrap()];
+    place_payloads(&mut part1_bytes, BLOCK_SECTOR_COUNT, &second.payloads);
+    fs::write(dir.join("bigfile.001"), part1_bytes).unwrap();
+}
+
+/// First sector after a FAT of `record_count` records, where the test archives start payloads.
+fn first_payload_sector(record_count: usize) -> u32 {
+    sector_count(u32::try_from(fat_byte_len(record_count).unwrap()).unwrap()).max(1)
+}
+
+/// Records laid out one after another, each payload in its own sectors.
+struct RecordLayout<'a> {
+    /// Each record's TOC fields.
+    toc: Vec<(u32, u32, u32, u32, i32)>,
+    /// Each record's `(sector_number, payload)`.
+    payloads: Vec<(u32, &'a [u8])>,
+    /// First sector after the last payload.
+    end_sector: u32,
+}
+
+impl<'a> RecordLayout<'a> {
+    /// Lays `records` out in the order given, the first starting at `first_sector`.
+    fn new(records: &[ArchiveRecord<'a>], first_sector: u32) -> Self {
+        let mut layout = Self {
+            toc: Vec::with_capacity(records.len()),
+            payloads: Vec::with_capacity(records.len()),
+            end_sector: first_sector,
+        };
+        for record in records {
+            layout.toc.push(record.toc_fields(layout.end_sector));
+            layout.payloads.push((layout.end_sector, record.payload));
+            layout.end_sector += sector_count(u32::try_from(record.payload.len()).unwrap());
+        }
+        layout
     }
-    write_part0(path, endian, next_sector, &fat_records, &payloads);
 }
 
 /// Writes each `(file name, hash)` under `dir` as a separate archive holding one stored record of
@@ -263,7 +339,7 @@ pub(crate) fn write_part0(
     records: &[(u32, u32, u32, u32, i32)],
     payloads: &[(u32, &[u8])],
 ) {
-    let total_bytes = sector_logical_offset(sectors) as usize;
+    let total_bytes = usize::try_from(sector_logical_offset(sectors)).unwrap();
     fs::write(
         path,
         build_part0_bytes(endian, total_bytes, records, payloads),
@@ -287,9 +363,15 @@ pub(crate) fn build_part0_bytes(
     let fat = build_fat_bytes(endian, records);
     let mut part0 = vec![0u8; total_bytes.max(fat.len())];
     part0[..fat.len()].copy_from_slice(&fat);
-    for &(sector, data) in payloads {
-        let start = sector_logical_offset(sector) as usize;
-        part0[start..start + data.len()].copy_from_slice(data);
-    }
+    place_payloads(&mut part0, 0, payloads);
     part0
+}
+
+/// Copies each `(sector_number, payload)` into `part`, a part file whose first byte is logical
+/// sector `first_sector`.
+fn place_payloads(part: &mut [u8], first_sector: u32, payloads: &[(u32, &[u8])]) {
+    for &(sector, data) in payloads {
+        let start = usize::try_from(sector_logical_offset(sector - first_sector)).unwrap();
+        part[start..start + data.len()].copy_from_slice(data);
+    }
 }

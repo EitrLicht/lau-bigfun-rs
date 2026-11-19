@@ -370,7 +370,7 @@ pub(crate) struct UnpackArgs {
     #[command(flatten)]
     pub(crate) payload: RawArgs,
 
-    /// Number of parallel worker threads (0 = auto-detect CPU cores, 1 = sequential)
+    /// Number of parallel worker threads (0 = auto-detect CPU cores, 1 = sequential; at most 64)
     #[arg(short, long, default_value_t = 0)]
     pub(crate) jobs: usize,
 

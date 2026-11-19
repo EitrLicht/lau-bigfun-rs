@@ -2,7 +2,9 @@
 
 use std::io::Write;
 
-use lau_bigfun::{Bigfile, EntryFilter, UnpackOptions, UnpackReport, name_hash, unpack_archive};
+use lau_bigfun::{
+    Bigfile, EntryFilter, MAX_UNPACK_JOBS, UnpackOptions, UnpackReport, name_hash, unpack_archive,
+};
 
 mod args;
 mod extract;
@@ -53,6 +55,12 @@ fn run_unpack<W: Write, E: Write>(
     let bigfile = args.archive.open()?;
     let dict = args.dict.load_for_filter(filter.as_ref(), status)?;
     warn_if_names_miss_archive(&dict, &bigfile, status);
+    if args.jobs > MAX_UNPACK_JOBS {
+        status.println(format_args!(
+            "warning: --jobs {} is above the maximum of {MAX_UNPACK_JOBS}; using {MAX_UNPACK_JOBS}",
+            args.jobs
+        ));
+    }
     let options = unpack_options(args, filter, &bigfile);
     let report = unpack_archive(&bigfile, &dict, &args.output, &options).map_err(with_flag_hint)?;
     // A real unpack already failed on this limit; a dry run reports the plan and warns instead.

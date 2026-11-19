@@ -40,6 +40,27 @@ fn unpack_warns_when_the_filelist_names_no_archive_hash() {
 }
 
 #[test]
+fn unpack_warns_when_jobs_exceed_the_maximum() {
+    let (dir, archive_path) = create_synthetic_archive("unpack_jobs_over_max");
+    let out = dir.join("out");
+    let argv = [
+        "unpack",
+        archive_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--dry-run",
+        "--jobs",
+        "1000",
+    ];
+
+    let (_, status) = exec_args(&argv, false).unwrap();
+    assert!(
+        status.contains("warning: --jobs 1000 is above the maximum of 64; using 64"),
+        "{status}"
+    );
+}
+
+#[test]
 fn unpack_default_limit_rejects_amplified_archive() {
     let dir = TempDir::new("default_limit");
     let (archive, out) = create_amplified_archive(&dir);

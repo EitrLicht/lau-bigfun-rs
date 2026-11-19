@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use lau_bigfun::format::SECTOR_BYTE_COUNT;
 use lau_bigfun::path::normalized_rel_key;
 use lau_bigfun::{
-    ArchiveSet, Bigfile, BigfileError, Endian, Fat, HashDictionary, OpenOptions, name_hash,
+    ArchiveSet, Bigfile, BigfileError, Endian, Fat, HashDictionary, OpenOptions,
+    RelativeOutputPath, name_hash,
 };
 
 struct OracleSpec {
@@ -127,8 +128,27 @@ const TRU_SPEC: OracleSpec = OracleSpec {
     ],
 };
 
-fn resolve_env_path(env_var: &str, val: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+/// Setting this to `1` makes every oracle variable required, so a run that would skip checks for
+/// an unset variable fails instead of passing without checking anything.
+const REQUIRE_ORACLES_VAR: &str = "LAU_BIGFUN_REQUIRE_ORACLES";
+
+/// Returns `true` if [`REQUIRE_ORACLES_VAR`] is set to `1`.
+fn oracles_required() -> bool {
+    std::env::var_os(REQUIRE_ORACLES_VAR).is_some_and(|val| val == "1")
+}
+
+/// Returns the path an oracle variable `env_var` holds (`val`), or `None` when it is unset, which
+/// skips its checks unless `required` is set. A set but empty path fails.
+fn resolve_env_path(
+    env_var: &str,
+    val: Option<&std::ffi::OsStr>,
+    required: bool,
+) -> Option<PathBuf> {
     let Some(val) = val else {
+        assert!(
+            !required,
+            "environment variable {env_var} is not set, and {REQUIRE_ORACLES_VAR}=1 requires every oracle variable"
+        );
         eprintln!("skipping oracle check: environment variable {env_var} is not set");
         return None;
     };
@@ -146,12 +166,12 @@ fn open_archive(path: &Path) -> Bigfile {
 
 fn test_archive_dir(spec: &OracleSpec) -> Option<PathBuf> {
     let val = std::env::var_os(spec.env_var);
-    resolve_env_path(spec.env_var, val.as_deref())
+    resolve_env_path(spec.env_var, val.as_deref(), oracles_required())
 }
 
 fn test_filelist(spec: &OracleSpec) -> Option<HashDictionary> {
     let val = std::env::var_os(spec.filelist_env_var);
-    let path = resolve_env_path(spec.filelist_env_var, val.as_deref())?;
+    let path = resolve_env_path(spec.filelist_env_var, val.as_deref(), oracles_required())?;
     let mut dict = HashDictionary::new();
     dict.load_file(&path)
         .unwrap_or_else(|e| panic!("load_file({}) failed: {e}", path.display()));
@@ -186,7 +206,7 @@ fn assert_output_paths_follow_filelist(bf: &Bigfile, game_dict: &HashDictionary)
     let mut output_keys = HashSet::new();
     for run in bf.hash_runs() {
         let h = run[0].name_hash;
-        let (path, resolved) = game_dict.relative_path_or_fallback(h);
+        let RelativeOutputPath { path, resolved, .. } = game_dict.relative_path_or_fallback(h);
         assert!(resolved, "hash {h:#010x} missing from game filelist");
         // Sanitization drops empty and `.` segments, such as a root-relative name's leading `\`,
         // and resolves `..`, so Anniversary's `sndstrm\..\cinstream` is `cinstream`. Every other
@@ -211,11 +231,11 @@ fn assert_output_paths_follow_filelist(bf: &Bigfile, game_dict: &HashDictionary)
 }
 
 fn assert_oracle_segment_bounds(bf: &Bigfile, seg: u64) {
-    let sectors_per_seg = (seg / (SECTOR_BYTE_COUNT as u64)) as u32;
+    let sectors_per_seg = u32::try_from(seg / u64::from(SECTOR_BYTE_COUNT)).unwrap();
     let start_sectors: HashSet<u32> = bf.entries().iter().map(|e| e.sector_number).collect();
 
     for k in 1..bf.part_paths().len() {
-        let expected_sector = (k as u32) * sectors_per_seg;
+        let expected_sector = u32::try_from(k).unwrap() * sectors_per_seg;
         assert!(
             start_sectors.contains(&expected_sector),
             "no entry starts part {k} at sector {expected_sector}"
@@ -230,7 +250,7 @@ fn assert_oracle_segment_bounds(bf: &Bigfile, seg: u64) {
             continue;
         }
         let start = e.logical_offset();
-        let end = start + (e.stored_size() as u64);
+        let end = start + u64::from(e.stored_size());
         assert_eq!(
             start / seg,
             (end - 1) / seg,
@@ -311,46 +331,51 @@ fn assert_patch_archive(bf: &Bigfile, expected_patch_entries: Option<usize>) {
     }
 }
 
+/// Returns the entry's bytes after checking both reads return the sizes its record declares.
+fn read_checked(bf: &Bigfile, e: &lau_bigfun::Entry) -> Vec<u8> {
+    assert_eq!(
+        bf.read_entry(e, true).unwrap().len(),
+        e.stored_size() as usize
+    );
+    let bytes = bf.read_entry(e, false).unwrap();
+    assert_eq!(bytes.len(), e.size as usize);
+    bytes
+}
+
 fn assert_reads_across_all_parts(spec: &OracleSpec) {
     let Some(archive_dir) = test_archive_dir(spec) else {
         return;
     };
 
     let bf = open_archive(&archive_dir);
-    let seg = bf.segment_length().unwrap();
-    assert_eq!(seg, spec.expected_segment_length);
-
-    // Returns the entry's bytes after checking both reads return the sizes its record declares.
-    let read_checked = |e: &lau_bigfun::Entry| {
-        assert_eq!(
-            bf.read_entry(e, true).unwrap().len(),
-            e.stored_size() as usize
-        );
-        let bytes = bf.read_entry(e, false).unwrap();
-        assert_eq!(bytes.len(), e.size as usize);
-        bytes
-    };
     let mut parts_sample = crc32fast::Hasher::new();
     for part_idx in 0..bf.part_paths().len() {
         let in_part =
-            |e: &&lau_bigfun::Entry| bf.locate_coords(e).is_ok_and(|(part, _)| part == part_idx);
+            |e: &&lau_bigfun::Entry| bf.locate(e).is_ok_and(|loc| loc.part_index == part_idx);
         let entry = bf
             .entries()
             .iter()
             .filter(in_part)
             .find(|e| e.stored_size() > 0)
             .unwrap();
-        parts_sample.update(&read_checked(entry));
+        parts_sample.update(&read_checked(&bf, entry));
     }
     assert_eq!(
         parts_sample.finalize(),
         spec.parts_sample_crc32,
         "CRC-32 over the first non-empty entry of each part"
     );
+}
 
+fn assert_named_entries_read_back(spec: &OracleSpec) {
+    let Some(archive_dir) = test_archive_dir(spec) else {
+        return;
+    };
+
+    let bf = open_archive(&archive_dir);
     let probe_matches = bf.find(name_hash(spec.probe_path).unwrap());
     assert_eq!(
-        crc32fast::hash(&read_checked(&probe_matches[0])),
+        crc32fast::hash(&read_checked(&bf, &probe_matches[0])),
         spec.probe_crc32,
         "CRC-32 of {}",
         spec.probe_path
@@ -362,7 +387,7 @@ fn assert_reads_across_all_parts(spec: &OracleSpec) {
         .find_with_spec_mask(lara_hash, lara_matches[0].spec_flags)
         .unwrap();
     assert_eq!(
-        crc32fast::hash(&read_checked(lara_entry)),
+        crc32fast::hash(&read_checked(&bf, lara_entry)),
         spec.lara_crc32,
         r"CRC-32 of pc-w\lara.drm"
     );
@@ -511,6 +536,12 @@ fn trl_reads_across_all_parts() {
 
 #[test]
 #[ignore = "needs retail archives; set the LAU_BIGFUN_* variables"]
+fn trl_named_entries_read_back() {
+    assert_named_entries_read_back(&TRL_SPEC);
+}
+
+#[test]
+#[ignore = "needs retail archives; set the LAU_BIGFUN_* variables"]
 fn tra_filelist_coverage() {
     assert_filelist_coverage(&TRA_SPEC);
 }
@@ -531,6 +562,12 @@ fn tra_bigfile_virtual_dat_discovery() {
 #[ignore = "needs retail archives; set the LAU_BIGFUN_* variables"]
 fn tra_reads_across_all_parts() {
     assert_reads_across_all_parts(&TRA_SPEC);
+}
+
+#[test]
+#[ignore = "needs retail archives; set the LAU_BIGFUN_* variables"]
+fn tra_named_entries_read_back() {
+    assert_named_entries_read_back(&TRA_SPEC);
 }
 
 #[test]
@@ -558,6 +595,12 @@ fn tru_reads_across_all_parts() {
 }
 
 #[test]
+#[ignore = "needs retail archives; set the LAU_BIGFUN_* variables"]
+fn tru_named_entries_read_back() {
+    assert_named_entries_read_back(&TRU_SPEC);
+}
+
+#[test]
 fn probe_paths_hash_to_their_expected_values() {
     for spec in [&TRL_SPEC, &TRA_SPEC, &TRU_SPEC] {
         assert_eq!(
@@ -571,9 +614,13 @@ fn probe_paths_hash_to_their_expected_values() {
 
 #[test]
 fn resolve_env_path_handles_optional_os_str() {
-    assert_eq!(resolve_env_path("LAU_TEST_VAR", None), None);
+    assert_eq!(resolve_env_path("LAU_TEST_VAR", None, false), None);
     assert_eq!(
-        resolve_env_path("LAU_TEST_VAR", Some(std::ffi::OsStr::new("/tmp/archive"))),
+        resolve_env_path(
+            "LAU_TEST_VAR",
+            Some(std::ffi::OsStr::new("/tmp/archive")),
+            false
+        ),
         Some(PathBuf::from("/tmp/archive"))
     );
 }
@@ -581,11 +628,19 @@ fn resolve_env_path_handles_optional_os_str() {
 #[test]
 #[should_panic(expected = "environment variable LAU_TEST_VAR is set to an empty path")]
 fn resolve_env_path_panics_when_set_to_empty_string() {
-    let _ = resolve_env_path("LAU_TEST_VAR", Some(std::ffi::OsStr::new("")));
+    let _ = resolve_env_path("LAU_TEST_VAR", Some(std::ffi::OsStr::new("")), false);
 }
 
 #[test]
 #[should_panic(expected = "environment variable LAU_TEST_VAR is set to an empty path")]
 fn resolve_env_path_panics_when_set_to_whitespace_only() {
-    let _ = resolve_env_path("LAU_TEST_VAR", Some(std::ffi::OsStr::new("   ")));
+    let _ = resolve_env_path("LAU_TEST_VAR", Some(std::ffi::OsStr::new("   ")), false);
+}
+
+#[test]
+#[should_panic(
+    expected = "environment variable LAU_TEST_VAR is not set, and LAU_BIGFUN_REQUIRE_ORACLES=1 requires every oracle variable"
+)]
+fn resolve_env_path_panics_when_required_and_unset() {
+    let _ = resolve_env_path("LAU_TEST_VAR", None, true);
 }

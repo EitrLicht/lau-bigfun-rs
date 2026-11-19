@@ -6,8 +6,9 @@ name: Release
 #
 # Each job is isolated: `check` validates the tag before anything is built, `build` compiles only
 # the crate and its locked dependencies, `notices` runs cargo-about (tooling outside the crate's
-# dependency graph) apart from the executable, and `release`, which runs no compiled code, alone
-# can attest files or write releases.
+# dependency graph) apart from the executable, `advisories` checks Cargo.lock against the RustSec
+# advisory database with cargo-deny (also tooling), and `release`, which runs no compiled code and
+# waits for all of them, alone can attest files or write releases.
 on:
   push:
     tags:
@@ -22,7 +23,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.100.0"
+  RUST_TOOLCHAIN: "1.99.1"
   CARGO_ABOUT_VERSION: "0.9.3"
   TARGET: x86_64-pc-windows-msvc
 
@@ -126,9 +127,31 @@ jobs:
           retention-days: 7
           overwrite: true
 
+  advisories:
+    name: Check dependencies for security advisories
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Check Cargo.lock against the RustSec advisory database
+        run: .github/scripts/check-advisories.sh
+
   release:
     name: Package, attest and draft the release
-    needs: [check, build, notices]
+    needs: [check, build, notices, advisories]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -158,9 +181,9 @@ jobs:
 
       - name: Package the release archive
         run: |
-          cp LICENSE README.md dist/
+          cp LICENSE README.md CHANGELOG.md dist/
           cd dist
-          zip -X -j "$ARCHIVE.zip" lau-bigfun.exe LICENSE README.md THIRD-PARTY-LICENSES.txt
+          zip -X -j "$ARCHIVE.zip" lau-bigfun.exe LICENSE README.md CHANGELOG.md THIRD-PARTY-LICENSES.txt
           sha256sum "$ARCHIVE.zip" > "$ARCHIVE.zip.sha256"
 
       - name: Attest build provenance

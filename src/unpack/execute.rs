@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::ScopedJoinHandle;
 
+use super::MAX_UNPACK_JOBS;
 use super::plan::PlannedExtraction;
 use crate::archive::{Bigfile, BigfileError};
 use crate::fat::Entry;
-use crate::path::parent_dir;
+use crate::path::{FileId, parent_dir};
 
 /// Name prefix of every [`StagingDir`], followed by the process id and an attempt number.
 pub(super) const STAGING_DIR_PREFIX: &str = ".lau-bigfun-staging-";
@@ -43,6 +44,28 @@ fn write_entry_to_file(
         })
 }
 
+/// The part files of the archives an extraction reads, identified when each archive was opened,
+/// so that no destination replaces one.
+pub(super) struct ArchiveParts<'a>(Vec<&'a FileId>);
+
+impl<'a> ArchiveParts<'a> {
+    /// The part files of `archives`.
+    pub(super) fn of(archives: &'a [Bigfile]) -> Self {
+        Self(archives.iter().flat_map(Bigfile::part_ids).collect())
+    }
+
+    /// Fails with [`BigfileError::OutputIsArchivePart`] if `dest` reaches one of the part files.
+    /// A destination that does not exist yet cannot be one.
+    pub(super) fn check(&self, dest: &Path) -> Result<(), BigfileError> {
+        if FileId::of(dest).is_ok_and(|id| self.0.contains(&&id)) {
+            return Err(BigfileError::OutputIsArchivePart {
+                path: dest.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Creates all unique parent directories once up front before file extraction begins.
 pub(super) fn create_parent_directories(
     unique_dirs: &HashSet<PathBuf>,
@@ -57,7 +80,8 @@ fn create_output_dir(dir: &Path) -> Result<(), BigfileError> {
     fs::create_dir_all(dir).map_err(output_error(dir))
 }
 
-/// Resolves the effective worker thread count (`0` => available CPU parallelism), bounded by task count.
+/// Resolves the effective worker thread count (`0` => available CPU parallelism), bounded by task
+/// count and [`MAX_UNPACK_JOBS`].
 fn resolve_worker_count(requested_jobs: usize, task_count: usize) -> usize {
     let threads = if requested_jobs == 0 {
         std::thread::available_parallelism()
@@ -66,7 +90,7 @@ fn resolve_worker_count(requested_jobs: usize, task_count: usize) -> usize {
     } else {
         requested_jobs
     };
-    threads.min(task_count.max(1))
+    threads.min(MAX_UNPACK_JOBS).min(task_count.max(1))
 }
 
 /// Uniquely named hidden directory under the output directory that holds entries while they are
@@ -155,22 +179,26 @@ impl ExtractionJob<'_> {
         Ok(total_bytes)
     }
 
-    /// Extracts the items across `num_workers` threads sharing an `AtomicUsize` work index.
+    /// Extracts the items across up to `num_workers` threads sharing an `AtomicUsize` work index.
+    /// Workers take items from the shared index, so a thread the system cannot start leaves its
+    /// share to the ones that did start, or to this thread if none did.
     fn extract_in_parallel(&self, num_workers: usize) -> Result<u64, BigfileError> {
         let next_idx = AtomicUsize::new(0);
         let cancelled = AtomicBool::new(false);
+        let work = || {
+            let res = self.extract_from_queue(&next_idx, &cancelled);
+            if res.is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            res
+        };
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..num_workers)
-                .map(|_| {
-                    s.spawn(|| {
-                        let res = self.extract_from_queue(&next_idx, &cancelled);
-                        if res.is_err() {
-                            cancelled.store(true, Ordering::Relaxed);
-                        }
-                        res
-                    })
-                })
+                .map_while(|_| std::thread::Builder::new().spawn_scoped(s, work).ok())
                 .collect();
+            if handles.is_empty() {
+                return work();
+            }
             join_workers(handles)
         })
     }
@@ -244,14 +272,17 @@ fn follow_symlinks(path: &Path) -> PathBuf {
 ///
 /// # Errors
 ///
-/// Fails like [`Bigfile::read_entry`], and with [`BigfileError::OutputPath`] when the destination
-/// or its parent directories cannot be created, written or replaced.
+/// Fails like [`Bigfile::read_entry`], with [`BigfileError::OutputIsArchivePart`] before writing
+/// anything when `dest_path` reaches one of `bigfile`'s part files, and with
+/// [`BigfileError::OutputPath`] when the destination or its parent directories cannot be created,
+/// written or replaced.
 pub fn extract_entry(
     bigfile: &Bigfile,
     entry: &Entry,
     raw: bool,
     dest_path: &Path,
 ) -> Result<u64, BigfileError> {
+    ArchiveParts::of(std::slice::from_ref(bigfile)).check(dest_path)?;
     let replaceable = match fs::metadata(dest_path) {
         Ok(meta) => meta.is_file(),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -305,5 +336,10 @@ mod tests {
 
         let expected = staging.join("0");
         assert!(matches!(err, Err(BigfileError::OutputPath { path, .. }) if path == expected));
+    }
+
+    #[test]
+    fn worker_count_is_capped_however_many_jobs_are_requested() {
+        assert_eq!(resolve_worker_count(100_000, 10_000), MAX_UNPACK_JOBS);
     }
 }

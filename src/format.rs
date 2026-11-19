@@ -160,9 +160,9 @@ mod tests {
     #[test]
     fn is_block_aligned_detects_1mib_multiples() {
         assert!(is_block_aligned(0));
-        assert!(is_block_aligned(BLOCK_BYTE_COUNT as u64));
+        assert!(is_block_aligned(u64::from(BLOCK_BYTE_COUNT)));
         assert!(is_block_aligned(0x0960_0000));
-        assert!(!is_block_aligned(SECTOR_BYTE_COUNT as u64));
+        assert!(!is_block_aligned(u64::from(SECTOR_BYTE_COUNT)));
         assert!(!is_block_aligned(0x0960_0800));
     }
 

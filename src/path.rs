@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 /// normalized, traversal-safe relative [`PathBuf`] suitable for joining onto an extraction directory.
 ///
 /// A `..` segment steps back out of the segment before it, the way a filesystem resolves it, so
-/// `pc-w\sndstrm\..\cinstream\a.mul` becomes `pc-w/cinstream/a.mul`. At the start of the path
-/// there is nothing to step out of, so the result never climbs above the extraction directory.
+/// `pc-w\sndstrm\..\cinstream\a.mul` becomes `pc-w/cinstream/a.mul`. So does a segment that is
+/// `..` once its surrounding spaces and control characters are trimmed, such as `.. `. At the
+/// start of the path there is nothing to step out of, so the result never climbs above the
+/// extraction directory.
 #[must_use]
 pub fn sanitize_relative_path(archive_path: &str) -> PathBuf {
     let mut out = PathBuf::new();
     let without_drive = strip_drive_prefix(archive_path);
 
     for raw_segment in without_drive.split(['\\', '/']) {
-        if raw_segment == ".." {
+        if is_parent_segment(raw_segment) {
             out.pop();
         } else if let Some(cleaned) = sanitize_segment(raw_segment) {
             out.push(cleaned.as_ref());
@@ -26,6 +28,13 @@ pub fn sanitize_relative_path(archive_path: &str) -> PathBuf {
         out.push("unnamed.bin");
     }
     out
+}
+
+/// Returns `true` if `segment` is `..`, ignoring surrounding spaces and control characters, which
+/// sanitizing would strip anyway.
+#[inline]
+fn is_parent_segment(segment: &str) -> bool {
+    segment.trim_matches(|c: char| c == ' ' || c.is_control()) == ".."
 }
 
 /// Strips a leading Windows drive prefix (`C:` or `C:\`) if present.
@@ -151,6 +160,64 @@ pub fn normalized_rel_key(path: &Path) -> String {
     path.to_string_lossy().chars().map(fold_path_char).collect()
 }
 
+/// Identity of an existing file, equal for any two paths that reach it: its device and inode on
+/// Unix, so symbolic and hard links compare equal, and a key of its canonical path on Windows,
+/// which resolves symbolic links and letter case but not hard links (see `windows_path_key`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileId(#[cfg(unix)] (u64, u64), #[cfg(windows)] String);
+
+impl FileId {
+    /// Identifies the file at `path`, whose metadata is `meta`. On Unix the identity comes from
+    /// `meta` alone, so for a file that is already open it stays right however `path` changes
+    /// later. On Windows it is the key of the canonical path, or of the absolute path on a drive
+    /// where that cannot be resolved, so that identifying a file never stops an archive from
+    /// opening and either spelling of one file gives the same key.
+    ///
+    /// # Errors
+    ///
+    /// Never on Unix. On Windows, fails like [`std::path::absolute`] when even the absolute path
+    /// cannot be formed.
+    pub(crate) fn from_metadata(meta: &std::fs::Metadata, path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let _ = path;
+            Ok(Self((meta.dev(), meta.ino())))
+        }
+        #[cfg(windows)]
+        {
+            let _ = meta;
+            let resolved = std::fs::canonicalize(path).or_else(|_| std::path::absolute(path))?;
+            Ok(Self(windows_path_key(&resolved)))
+        }
+    }
+
+    /// Identifies the file `path` reaches, following links.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`std::fs::metadata`], such as when `path` does not exist, and otherwise like
+    /// [`Self::from_metadata`].
+    #[cfg(feature = "unpack")]
+    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
+        Self::from_metadata(&std::fs::metadata(path)?, path)
+    }
+}
+
+/// Comparison key of an absolute Windows path: without a `\\?\` verbatim prefix, folded like
+/// [`normalized_rel_key`] (`/` separators, ASCII and Latin-1 letters lowercase). The canonical
+/// (verbatim) and absolute spellings of one path give the same key, as do spellings that differ
+/// only in letter case, which Windows filesystems ignore.
+#[cfg(any(windows, test))]
+fn windows_path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let unprefixed = match text.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => Cow::Owned(format!(r"\\{unc}")),
+        None => Cow::Borrowed(text.strip_prefix(r"\\?\").unwrap_or(&text)),
+    };
+    normalized_rel_key(Path::new(unprefixed.as_ref()))
+}
+
 /// Appends `suffix` to the file stem of `path`, before any extension.
 #[cfg(feature = "unpack")]
 pub(crate) fn append_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -174,6 +241,30 @@ pub(crate) fn append_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_key_ignores_the_verbatim_prefix() {
+        assert_eq!(
+            windows_path_key(Path::new(r"\\?\C:\Games\TR\bigfile.000")),
+            windows_path_key(Path::new(r"C:\Games\TR\bigfile.000"))
+        );
+    }
+
+    #[test]
+    fn windows_key_keeps_the_server_of_a_verbatim_unc_path() {
+        assert_eq!(
+            windows_path_key(Path::new(r"\\?\UNC\server\share\bigfile.000")),
+            windows_path_key(Path::new(r"\\server\share\bigfile.000"))
+        );
+    }
+
+    #[test]
+    fn windows_key_ignores_letter_case() {
+        assert_eq!(
+            windows_path_key(Path::new(r"C:\Games\TR\BIGFILE.000")),
+            windows_path_key(Path::new(r"c:\games\tr\bigfile.000"))
+        );
+    }
 
     #[cfg(feature = "unpack")]
     #[test]
@@ -204,7 +295,7 @@ mod tests {
             (r"C:pc-w\lara.drm", "pc-w/lara.drm"),
             (r"C:\pc-w\lara.drm", "pc-w/lara.drm"),
             (r"pc-w\foo.bin:$DATA", "pc-w/foo.bin_$DATA"),
-            (r"pc-w\.. \lara.drm. ", "pc-w/lara.drm"),
+            (r"pc-w\units\.. \lara.drm. ", "pc-w/lara.drm"),
             ("pc-w\\foo.\t.", "pc-w/foo"),
             (r"pc-w\con\nul.drm", "pc-w/_con/_nul.drm"),
             (
@@ -222,6 +313,21 @@ mod tests {
             sanitize_relative_path(r"pc-w\sndstrm\..\cinstream\a.mul"),
             PathBuf::from("pc-w/cinstream/a.mul")
         );
+    }
+
+    #[test]
+    fn segment_that_cleans_to_parent_steps_back() {
+        for raw in [
+            r"pc-w\sndstrm\.. \cinstream\a.mul",
+            r"pc-w\sndstrm\ ..\cinstream\a.mul",
+            "pc-w\\sndstrm\\..\u{7}\\cinstream\\a.mul",
+        ] {
+            assert_eq!(
+                sanitize_relative_path(raw),
+                PathBuf::from("pc-w/cinstream/a.mul"),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

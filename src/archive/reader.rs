@@ -88,7 +88,9 @@ impl Read for PositionalFileReader<'_> {
         if remaining == 0 || buf.is_empty() {
             return Ok(0);
         }
-        let to_read = (buf.len() as u64).min(remaining) as usize;
+        let to_read = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         read_exact_at_os(self.file, &mut buf[..to_read], self.offset)?;
         self.offset += to_read as u64;
         Ok(to_read)
@@ -127,7 +129,8 @@ type Inflater<R> = Take<ZlibDecoder<FlagReadError<R>>>;
 
 /// Streamed reader over one entry's payload, opened with
 /// [`Bigfile::open_entry`](super::Bigfile::open_entry): its stored bytes as they are, or
-/// zlib-inflated.
+/// zlib-inflated. [`Bigfile::open_entry_at`](super::Bigfile::open_entry_at) opens one over the
+/// stored bytes from an offset instead.
 ///
 /// The single owner of raw vs. inflated reads: [`Bigfile::read_entry`](super::Bigfile::read_entry)
 /// and [`Bigfile::read_entry_into`](super::Bigfile::read_entry_into) read through it too.
@@ -202,7 +205,7 @@ impl<'a> EntryReader<'a> {
                 u64::from(self.entry.size).min(MAX_UNTRUSTED_RESERVATION as u64)
             }
         };
-        let mut out = Vec::with_capacity(capacity as usize);
+        let mut out = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
         self.read_to_end(&mut out).map_err(into_bigfile_error)?;
         Ok(out)
     }
@@ -288,7 +291,8 @@ fn copy_chunked<R: Read, W: Write>(
     out: &mut W,
     read_err: impl Fn(io::Error) -> BigfileError,
 ) -> Result<u64, BigfileError> {
-    let chunk_len = expected_len.min(STREAM_CHUNK_BYTES as u64) as usize;
+    let chunk_len =
+        usize::try_from(expected_len).map_or(STREAM_CHUNK_BYTES, |len| len.min(STREAM_CHUNK_BYTES));
     if chunk.len() < chunk_len {
         chunk.resize(chunk_len, 0);
     }
@@ -327,12 +331,14 @@ mod tests {
     use crate::archive::Bigfile;
     use crate::format::Endian;
     use crate::test_support::{
-        ArchiveRecord, FailingWriter, TempDir, truncate_file, write_archive, zlib_compress,
+        ArchiveRecord, FailingWriter, TempDir, write_archive, write_two_part_archive, zlib_compress,
     };
 
     #[test]
     fn copy_chunked_bounds_buffer_to_stream_chunk() {
-        let payload: Vec<u8> = (0..STREAM_CHUNK_BYTES + 4096).map(|i| i as u8).collect();
+        let payload: Vec<u8> = (0..STREAM_CHUNK_BYTES + 4096)
+            .map(|i| u8::try_from(i % 256).unwrap())
+            .collect();
         let (mut chunk, mut out) = (Vec::new(), Vec::new());
         let copied = copy_chunked(
             &mut payload.as_slice(),
@@ -452,6 +458,59 @@ mod tests {
         assert_eq!(&buf[..n], payload);
     }
 
+    #[test]
+    fn positional_read_past_the_end_of_a_file_is_unexpected_eof() {
+        let dir = TempDir::new("read_past_end");
+        let path = dir.join("short.bin");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let err = read_exact_at_os(&file, &mut [0u8; 8], 6).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// [`Read`] over a slice that fails with `UnexpectedEof` once the slice runs out, like a part
+    /// file that ends early.
+    struct EndsEarlyReader<'a>(&'a [u8]);
+
+    impl Read for EndsEarlyReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.0.read(buf)
+        }
+    }
+
+    #[test]
+    fn inflated_read_reports_a_part_ending_early_as_io() {
+        let payload = patterned_payload(10_000);
+        let zlib = zlib_compress(&payload);
+        let mut inflated = ZlibDecoder::new(FlagReadError::new(EndsEarlyReader(&zlib[..20])))
+            .take(payload.len() as u64 + 1);
+        let entry = Entry {
+            index: 1,
+            name_hash: ZLIB_HASH,
+            size: u32::try_from(payload.len()).unwrap(),
+            sector_number: 1,
+            spec_flags: 1,
+            deflated_size: i32::try_from(zlib.len()).unwrap(),
+        };
+        let mut buf = [0u8; 4096];
+
+        let err = loop {
+            match read_inflated(&entry, &mut inflated, &mut buf) {
+                Ok(0) => panic!("the stream ended without an error"),
+                Ok(_) => {}
+                Err(err) => break err,
+            }
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(carried_error(&err).is_none(), "{err:?}");
+    }
+
     /// Record holding the payload as stored bytes, at sector 1.
     const STORED_HASH: u32 = 0x1;
     /// Record holding the zlib stream, right after the stored record.
@@ -469,13 +528,14 @@ mod tests {
 
     /// Bytes that repeat with a period of 251, so no two nearby chunks look alike.
     fn patterned_payload(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8).collect()
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
     }
 
     /// Writes an archive holding `payload` both stored and zlib-compressed at its own size.
     fn create_payload_archive(prefix: &str, payload: &[u8]) -> TempDir {
         let dir = TempDir::new(prefix);
-        write_two_record_archive(&dir, payload, &zlib_compress(payload), payload.len() as u32);
+        let size = u32::try_from(payload.len()).unwrap();
+        write_two_record_archive(&dir, payload, &zlib_compress(payload), size);
         dir
     }
 
@@ -521,10 +581,14 @@ mod tests {
     }
 
     /// Opens the archive in `dir`, then cuts its part file `keep` bytes into record `hash`.
+    ///
+    /// Only on Unix: on Windows an open part cannot be written to (`open_part`), so a part never
+    /// ends early once opened, and the tests that use this helper are Unix-only too.
+    #[cfg(unix)]
     fn open_cut_short(dir: &TempDir, hash: u32, keep: u64) -> Bigfile {
         let bf = Bigfile::open(dir).unwrap();
-        let (_, offset) = bf.locate_coords(&entry(&bf, hash)).unwrap();
-        truncate_file(dir.join("bigfile.000"), offset + keep);
+        let location = bf.locate(&entry(&bf, hash)).unwrap();
+        crate::test_support::truncate_file(dir.join("bigfile.000"), location.offset_in_part + keep);
         bf
     }
 
@@ -609,6 +673,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_rejects_short_stored_payload() {
         let dir = create_payload_archive("stream_short_stored", &patterned_payload(5000));
@@ -683,6 +748,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_reports_part_read_failure_as_io() {
         let dir = create_payload_archive("stream_part_failure", &patterned_payload(5000));
@@ -692,10 +758,12 @@ mod tests {
         assert!(carried_error(&err).is_none());
     }
 
+    #[cfg(unix)]
     fn is_part_read_failure(err: &BigfileError) -> bool {
         matches!(err, BigfileError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_entry_reports_zlib_part_read_failure_as_io() {
         let dir = create_payload_archive("whole_part_failure", &patterned_payload(5000));
@@ -704,6 +772,7 @@ mod tests {
         assert!(is_part_read_failure(&err));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_entry_into_reports_zlib_part_read_failure_as_io() {
         let dir = create_payload_archive("chunked_part_failure", &patterned_payload(5000));
@@ -712,6 +781,7 @@ mod tests {
         assert!(is_part_read_failure(&err));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_entry_reports_stored_part_read_failure_as_io() {
         let dir = create_payload_archive("whole_stored_failure", &patterned_payload(5000));
@@ -720,6 +790,7 @@ mod tests {
         assert!(is_part_read_failure(&err));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_entry_into_reports_stored_part_read_failure_as_io() {
         let dir = create_payload_archive("chunked_stored_failure", &patterned_payload(5000));
@@ -762,6 +833,102 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Reads the stored bytes of record `hash` from `offset` to the end, in reads of 4 KiB.
+    fn read_from(bf: &Bigfile, hash: u32, offset: u64) -> io::Result<Vec<u8>> {
+        read_in_steps(bf.open_entry_at(&entry(bf, hash), offset).unwrap(), 4096)
+    }
+
+    #[test]
+    fn open_entry_at_zero_matches_raw_open_entry() {
+        let dir = create_payload_archive("at_zero", &patterned_payload(10_000));
+        let bf = Bigfile::open(&dir).unwrap();
+        let (streamed, ended) = stream(&bf, ZLIB_HASH, true);
+        ended.unwrap();
+        assert_eq!(read_from(&bf, ZLIB_HASH, 0).unwrap(), streamed);
+    }
+
+    /// Record [`write_two_part_archive`] stores at the start of part 1.
+    const PART1_HASH: u32 = 0x3;
+
+    #[test]
+    fn open_entry_at_reads_from_inside_an_entry_in_a_later_part() {
+        let payload = patterned_payload(10_000);
+        let dir = TempDir::new("at_part1");
+        let part0 = [ArchiveRecord::stored(STORED_HASH, 1, b"in part 0")];
+        let part1 = [ArchiveRecord::stored(PART1_HASH, 1, &payload)];
+        write_two_part_archive(&dir, &part0, &part1);
+        let bf = Bigfile::open(&dir).unwrap();
+        assert_eq!(read_from(&bf, PART1_HASH, 4321).unwrap(), payload[4321..]);
+    }
+
+    #[test]
+    fn open_entry_at_entry_end_reads_nothing() {
+        let dir = create_payload_archive("at_end", &patterned_payload(5000));
+        let bf = Bigfile::open(&dir).unwrap();
+        assert!(read_from(&bf, STORED_HASH, 5000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_entry_at_rejects_offset_past_entry_end() {
+        let dir = create_payload_archive("at_past_end", &patterned_payload(5000));
+        let bf = Bigfile::open(&dir).unwrap();
+        for past_end in [5001, u64::MAX] {
+            let err = bf
+                .open_entry_at(&entry(&bf, STORED_HASH), past_end)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    BigfileError::OffsetPastEntryEnd {
+                        index: 0,
+                        name_hash: STORED_HASH,
+                        offset,
+                        stored_size: 5000,
+                    } if offset == past_end
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_entry_at_returns_stored_bytes_of_compressed_entry() {
+        let payload = patterned_payload(10_000);
+        let dir = create_payload_archive("at_zlib", &payload);
+        let bf = Bigfile::open(&dir).unwrap();
+        let zlib = zlib_compress(&payload);
+        let middle = zlib.len() / 2;
+        let read = read_from(&bf, ZLIB_HASH, middle as u64).unwrap();
+        assert_eq!(read, zlib[middle..]);
+    }
+
+    #[test]
+    fn open_entry_at_serves_concurrent_readers_of_one_entry() {
+        let payload = patterned_payload(STREAM_CHUNK_BYTES + 4096);
+        let dir = create_payload_archive("at_threads", &payload);
+        let bf = &Bigfile::open(&dir).unwrap();
+        let offsets = [0, 1, 4096, 65_537, STREAM_CHUNK_BYTES, payload.len()];
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = offsets
+                .iter()
+                .map(|&offset| scope.spawn(move || read_from(bf, STORED_HASH, offset as u64)))
+                .collect();
+            for (reader, offset) in readers.into_iter().zip(offsets) {
+                let read = reader.join().unwrap().unwrap();
+                assert_eq!(read, payload[offset..], "offset {offset}");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_entry_at_reports_part_file_ending_early() {
+        let dir = create_payload_archive("at_short", &patterned_payload(5000));
+        let bf = open_cut_short(&dir, STORED_HASH, 100);
+        let err = read_from(&bf, STORED_HASH, 50).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
