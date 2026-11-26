@@ -15,7 +15,8 @@ use flate2::write::ZlibEncoder;
 use crate::archive::{Bigfile, OpenOptions};
 use crate::fat::Entry;
 use crate::format::{
-    BLOCK_SECTOR_COUNT, Endian, SECTOR_BYTE_COUNT, fat_byte_len, sector_logical_offset,
+    BLOCK_BYTE_COUNT, BLOCK_SECTOR_COUNT, Endian, SECTOR_BYTE_COUNT, fat_byte_len,
+    sector_logical_offset,
 };
 
 /// One FAT record for [`build_fat_bytes`], its fields named as in [`Entry`], which also numbers
@@ -139,6 +140,24 @@ impl Write for FailingWriter {
     fn flush(&mut self) -> io::Result<()> {
         Err(io::Error::new(self.0, "stream error"))
     }
+}
+
+/// Checks that `err.source()` returns a `C`, and that `err`'s own message leaves out that cause's
+/// text, so printing the source chain shows the cause once. Returns the cause, for checks of the
+/// parts of its text a message might still repeat.
+pub(crate) fn assert_source_not_in_message<'a, C: std::error::Error + 'static>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> &'a C {
+    let cause = err
+        .source()
+        .and_then(|source| source.downcast_ref::<C>())
+        .unwrap_or_else(|| panic!("{err:?} has no {} source", std::any::type_name::<C>()));
+    let message = err.to_string();
+    assert!(
+        !message.contains(&cause.to_string()),
+        "{message:?} repeats its source {cause:?}"
+    );
+    cause
 }
 
 #[inline]
@@ -373,6 +392,46 @@ pub(crate) fn write_part0(
         build_part0_bytes(endian, total_bytes, records, payloads),
     )
     .unwrap();
+}
+
+/// Writes to `dir` a two-part archive that fits two segment lengths: part 0 is exactly 2 MiB
+/// and ends with an empty record, and the first data past it is 1 MiB later, which part 1 is
+/// long enough to hold. Split every 3 MiB, that data starts part 1; split every 2 MiB, the
+/// empty record does, and the data lies 1 MiB in.
+pub(crate) fn write_two_segment_length_archive(dir: &Path) {
+    let part0_sectors = 1024;
+    let records = [
+        FatRow {
+            name_hash: 1,
+            size: 16,
+            sector_number: 1,
+            spec_flags: 1,
+            deflated_size: 0,
+        },
+        FatRow {
+            name_hash: 2,
+            size: 0,
+            sector_number: part0_sectors,
+            spec_flags: 1,
+            deflated_size: 0,
+        },
+        FatRow {
+            name_hash: 3,
+            size: 16,
+            sector_number: part0_sectors + 512,
+            spec_flags: 1,
+            deflated_size: 0,
+        },
+    ];
+    write_part0(
+        dir.join("bigfile.000"),
+        Endian::Little,
+        part0_sectors,
+        &records,
+        &[],
+    );
+    let part1_len = usize::try_from(BLOCK_BYTE_COUNT).unwrap() + 16;
+    fs::write(dir.join("bigfile.001"), vec![0u8; part1_len]).unwrap();
 }
 
 /// Writes to `path` a two-sector part 0 holding one empty record at sector 1.

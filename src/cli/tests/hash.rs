@@ -18,6 +18,23 @@ fn hash_command_writes_formatted_hashes_to_stdout() {
 }
 
 #[test]
+fn hash_trims_a_name_as_extract_and_filelists_do() {
+    let mut hash_buf = Vec::new();
+
+    run_hash(
+        &mut hash_buf,
+        &[" pc-w\\lara.drm\t".to_string()],
+        OutputMode::Text,
+    )
+    .unwrap();
+
+    assert_eq!(
+        String::from_utf8(hash_buf).unwrap(),
+        "0x5ff91900  pc-w\\lara.drm\n"
+    );
+}
+
+#[test]
 fn hash_json_emits_filename_hash_records() {
     let (out, err) = exec_args(
         &["hash", r"pc-w\lara.drm", r"pc-w\alister.drm", "--json"],

@@ -281,6 +281,25 @@ fn unpack_dry_run_warns_when_over_the_limit() {
 }
 
 #[test]
+fn unpack_dry_run_limit_warning_is_not_silenced_by_quiet() {
+    let dir = TempDir::new("dry_run_limit_quiet");
+    let (archive, out) = create_amplified_archive(&dir);
+    let argv = [
+        "-q",
+        "unpack",
+        archive.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--dry-run",
+    ];
+
+    let (_, status) = exec_args(&argv, false).unwrap();
+
+    let warning = "warning: planned output of 81920 bytes exceeds the limit";
+    assert!(status.contains(warning), "{status}");
+}
+
+#[test]
 fn unpack_dry_run_summary_is_not_silenced_by_quiet() {
     let (dir, archive) = create_synthetic_archive("dry_run_quiet");
     let out = dir.join("out");

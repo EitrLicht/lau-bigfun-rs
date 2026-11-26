@@ -89,3 +89,76 @@ fn write_json_stdout_tags_broken_pipe_errors() {
         assert!(!is_stdout_broken_pipe(other_err.as_ref()));
     }
 }
+
+/// Runs the CLI on `args`, given without the program name, with stdout writing to `stdout`, and
+/// returns the error it fails with.
+fn exec_with_failing_stdout(
+    args: &[&str],
+    mut stdout: impl io::Write,
+) -> Box<dyn std::error::Error> {
+    let cli = parse_args(args).unwrap();
+    let mut status = StatusReporter::new(Vec::new(), true);
+    execute_cli(cli, &mut stdout, false, &mut status).unwrap_err()
+}
+
+#[test]
+fn text_output_tags_only_a_broken_pipe_as_one() {
+    let (dir, archive_path) = create_synthetic_archive("text_stdout_pipe");
+    let a = archive_path.to_str().unwrap();
+    let out = dir.join("out");
+    let o = out.to_str().unwrap();
+    let commands: [&[&str]; 4] = [
+        &["list", a],
+        &["hash", r"pc-w\lara.drm"],
+        &["info", a],
+        &["unpack", a, "-o", o, "--dry-run"],
+    ];
+
+    for args in commands {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+            let unbuffered = exec_with_failing_stdout(args, FailingWriter(kind));
+            let buffered = exec_with_failing_stdout(args, BufWriter::new(FailingWriter(kind)));
+            for err in [unbuffered, buffered] {
+                assert_eq!(
+                    is_stdout_broken_pipe(err.as_ref()),
+                    kind == io::ErrorKind::BrokenPipe,
+                    "{args:?} with {kind:?}: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stdout_error_message_leaves_the_wrapped_error_to_source() {
+    let err = StdoutError(io::Error::other("disk on fire"));
+
+    assert_source_not_in_message::<io::Error>(&err);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn part_open_failure_prints_the_os_error_once() {
+    let (_dir, archive_path) = create_synthetic_archive("part_open_once");
+    // Windows refuses to open a part that another handle may write; elsewhere, a part without
+    // read permission is refused.
+    #[cfg(windows)]
+    let _writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&archive_path)
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&archive_path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Permissions don't bind root, so there is no failure to check.
+        if fs::File::open(&archive_path).is_ok() {
+            return;
+        }
+    }
+
+    let err = exec_args(&["info", archive_path.to_str().unwrap()], false).unwrap_err();
+
+    assert!(err.starts_with("cannot open archive part"), "{err}");
+    assert_eq!(err.matches("(os error").count(), 1, "{err}");
+}

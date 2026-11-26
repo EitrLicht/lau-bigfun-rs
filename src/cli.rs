@@ -3,7 +3,8 @@
 use std::io::Write;
 
 use lau_bigfun::{
-    Bigfile, EntryFilter, MAX_UNPACK_JOBS, UnpackOptions, UnpackReport, name_hash, unpack_archive,
+    Bigfile, EntryFilter, MAX_UNPACK_JOBS, UnpackOptions, UnpackReport, name_hash, trim_name,
+    unpack_archive,
 };
 
 mod args;
@@ -20,11 +21,11 @@ use args::{Commands, UnpackArgs, warn_if_names_miss_archive, with_flag_hint};
 use extract::run_extract;
 use info::run_info;
 use list::run_list;
+pub(crate) use output::{ErrorChain, StatusReporter, is_stdout_broken_pipe};
 use output::{
     HashEntryRecord, HexU32, JSON_SCHEMA_VERSION, OutputMode, StdoutError, UnpackJsonReport,
     write_entries, write_json_stdout,
 };
-pub(crate) use output::{StatusReporter, is_stdout_broken_pipe};
 
 /// Default limit on planned `unpack` output, as a multiple of the archive's size on disk.
 const DEFAULT_OUTPUT_EXPANSION: u64 = 16;
@@ -64,10 +65,11 @@ fn run_unpack<W: Write, E: Write>(
     let options = unpack_options(args, filter, &bigfile);
     let report = unpack_archive(&bigfile, &dict, &args.output, &options).map_err(with_flag_hint)?;
     // A real unpack already failed on this limit; a dry run reports the plan and warns instead.
+    // The warning stands in for that error, so `--quiet` does not hide it.
     if args.dry_run
         && let Err(over_limit) = options.check_output_limit(report.extracted_bytes)
     {
-        status.println(format_args!("warning: {}", with_flag_hint(over_limit)));
+        let _ = writeln!(status.writer, "warning: {}", with_flag_hint(over_limit));
     }
     // A text dry run's summary is its result, so it goes to stdout; otherwise it is status.
     let summary = unpack_summary(args, &report);
@@ -144,9 +146,11 @@ fn run_hash<W: Write>(
     mode: OutputMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Hash every name before writing any, so a name that cannot be hashed fails the command
-    // before a line is printed.
+    // before a line is printed. Names are trimmed as `extract` and filelists trim them, so all
+    // three hash the same text alike.
     let records: Vec<HashEntryRecord<'_>> = filenames
         .iter()
+        .map(|name| trim_name(name))
         .map(|name| {
             name_hash(name).map(|h| HashEntryRecord {
                 name,

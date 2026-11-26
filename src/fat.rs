@@ -18,7 +18,7 @@ use crate::format::{
 #[non_exhaustive]
 pub enum FatError {
     /// Reading the FAT failed.
-    #[error("I/O error while reading FAT: {0}")]
+    #[error("I/O error while reading FAT")]
     Io(#[from] io::Error),
 
     /// The input ends before the hashes and records its entry count declares.
@@ -184,6 +184,11 @@ pub struct Fat {
 /// once the data runs out instead of exhausting memory.
 pub(crate) const MAX_UNTRUSTED_RESERVATION: usize = 8 * 1024 * 1024;
 
+/// Bytes of the hash array read at a time while checking that its hashes are sorted (64 KiB). A
+/// FAT read in the wrong byte order almost always has hashes out of order, and then fails within
+/// this much more input instead of after its whole body is read and decoded.
+const HASH_CHECK_CHUNK_BYTES: usize = 64 * 1024;
+
 // A record is four 32-bit words, which `Fat::decode_entry` reads one by one.
 const _: () = assert!(RECORD_STRIDE == 4 * 4);
 
@@ -243,6 +248,46 @@ impl TableLayout {
         Ok(())
     }
 
+    /// Reads the hash array into `buf`, which may already hold its start from an earlier byte-order
+    /// candidate, [`HASH_CHECK_CHUNK_BYTES`] at a time, checking that each hash is no smaller than
+    /// the one before it. A FAT read in the wrong byte order almost always breaks the order within
+    /// its first few hashes, so it fails with [`FatError::UnsortedHashes`] before the rest of a
+    /// body as large as part 0 is read and decoded.
+    fn read_sorted_hashes<R: Read>(
+        &self,
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), FatError> {
+        let mut checked = 0;
+        let mut prev = None;
+        loop {
+            let available = buf.len().min(self.hashes_len);
+            let (hashes, _) = buf[checked..available].as_chunks::<FAT_HASH_BYTES>();
+            for (offset, &hash) in hashes.iter().enumerate() {
+                let curr = self.endian.read_u32(hash);
+                if let Some(prev) = prev
+                    && prev > curr
+                {
+                    return Err(FatError::UnsortedHashes {
+                        endian: self.endian,
+                        index: checked / FAT_HASH_BYTES + offset,
+                        prev,
+                        curr,
+                    });
+                }
+                prev = Some(curr);
+            }
+            checked += hashes.len() * FAT_HASH_BYTES;
+            if checked == self.hashes_len {
+                return Ok(());
+            }
+            let wanted = (self.hashes_len - buf.len()).min(HASH_CHECK_CHUNK_BYTES);
+            if reader.take(wanted as u64).read_to_end(buf)? == 0 {
+                return Err(self.truncated(buf.len()));
+            }
+        }
+    }
+
     /// Reads the rest of the body into `buf`, which may already hold its start from an earlier
     /// byte-order candidate, and returns the body. The first reservation is capped so a corrupt
     /// count fails with [`FatError::Truncated`] instead of exhausting memory.
@@ -282,10 +327,15 @@ impl Fat {
     /// - [`FatError::Truncated`] when the input, or `max_file_bytes`, is too short for the entry
     ///   count.
     /// - [`FatError::UnsortedHashes`] or [`FatError::NegativeDeflatedSize`] when a record is
-    ///   invalid.
+    ///   invalid. Hash order is checked as the hashes are read, so a table that has hashes out of
+    ///   order and is also cut short fails with `UnsortedHashes` if the misordered pair comes
+    ///   before the end of the input.
     ///
-    /// When auto-detecting and both byte orders fail, the error is from the order that reads the
-    /// smaller entry count, which is tried first.
+    /// When auto-detecting, the byte order that reads the smaller entry count (`Little` on ties)
+    /// is tried first. If the FAT is valid in both, that order's FAT is returned without an
+    /// error, unlike [`Bigfile`](crate::Bigfile), which fails with
+    /// [`BigfileError::AmbiguousEndian`](crate::BigfileError::AmbiguousEndian). If both fail, the
+    /// error is from that order too.
     pub fn parse_bounded<R: Read>(
         reader: &mut R,
         max_file_bytes: Option<u64>,
@@ -364,7 +414,8 @@ impl Fat {
     }
 
     /// Parses the FAT body in `endian` byte order: checks that it fits in `max_file_bytes`, reads
-    /// what `buf` does not already hold, then decodes and validates the entries. `reader` must be
+    /// what `buf` does not already hold, checking that the hashes are sorted as they arrive, then
+    /// decodes the entries and checks their records. `reader` must be
     /// positioned just past the header and whatever `buf` already holds, so attempts in different
     /// byte orders can share one buffer.
     pub(crate) fn try_candidate<R: Read>(
@@ -376,6 +427,7 @@ impl Fat {
     ) -> Result<Self, FatError> {
         let layout = TableLayout::new(header, endian)?;
         layout.check_fits(max_file_bytes)?;
+        layout.read_sorted_hashes(reader, buf)?;
         let body = layout.read_body(reader, buf)?;
         let (hashes, records) = body.split_at(layout.hashes_len);
         let entries = Self::decode_entries(hashes, records, endian);
@@ -413,43 +465,18 @@ impl Fat {
             .collect()
     }
 
-    /// Validates invariants for a single entry (`deflated_size >= 0` and sorted `name_hash`).
-    #[inline]
-    fn validate_entry(
-        index: usize,
-        prev_hash: Option<u32>,
-        entry: &Entry,
-        endian: Endian,
-    ) -> Result<(), FatError> {
-        if entry.deflated_size < 0 {
-            return Err(FatError::NegativeDeflatedSize {
+    /// Validates every entry's record: its `deflated_size` must not be negative. Hash order is
+    /// checked earlier, as the hashes are read (see `TableLayout::read_sorted_hashes`).
+    fn validate_entries(entries: &[Entry], endian: Endian) -> Result<(), FatError> {
+        match entries.iter().find(|entry| entry.deflated_size < 0) {
+            Some(entry) => Err(FatError::NegativeDeflatedSize {
                 endian,
-                index,
+                index: entry.index,
                 name_hash: entry.name_hash,
                 deflated_size: entry.deflated_size,
-            });
+            }),
+            None => Ok(()),
         }
-        if let Some(prev) = prev_hash
-            && prev > entry.name_hash
-        {
-            return Err(FatError::UnsortedHashes {
-                endian,
-                index,
-                prev,
-                curr: entry.name_hash,
-            });
-        }
-        Ok(())
-    }
-
-    /// Validates all entries in the table.
-    fn validate_entries(entries: &[Entry], endian: Endian) -> Result<(), FatError> {
-        let mut prev_hash = None;
-        for (i, entry) in entries.iter().enumerate() {
-            Self::validate_entry(i, prev_hash, entry, endian)?;
-            prev_hash = Some(entry.name_hash);
-        }
-        Ok(())
     }
 
     /// Returns the detected or configured byte order of this FAT.
@@ -583,7 +610,14 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_support::{FatRow, build_fat_bytes};
+    use crate::test_support::{FatRow, assert_source_not_in_message, build_fat_bytes};
+
+    #[test]
+    fn io_message_leaves_the_wrapped_error_to_source() {
+        let err = FatError::Io(io::Error::other("disk on fire"));
+
+        assert_source_not_in_message::<io::Error>(&err);
+    }
 
     /// Parses a FAT from `(name_hash, spec_flags)` pairs, with each record's size set to its index.
     fn fat_from_hash_flags(records: &[(u32, u32)]) -> Fat {
@@ -895,6 +929,30 @@ mod tests {
             .map(|entry| entry.size)
             .collect();
         assert_eq!(sizes, [100, 200]);
+    }
+
+    #[test]
+    fn misread_byte_order_fails_before_reading_the_whole_body() {
+        // 256 records with sorted hashes read big-endian as 65,536, a body of 1.3 MB.
+        let rows: Vec<_> = (0..256)
+            .map(|index| FatRow {
+                name_hash: 0x1000 + index * 0x100,
+                sector_number: 1,
+                ..FatRow::default()
+            })
+            .collect();
+        let mut bytes = build_fat_bytes(Endian::Little, &rows);
+        bytes.resize(fat_byte_len(0x0001_0000).unwrap(), 0);
+        let mut reader = Cursor::new(bytes);
+
+        let err = Fat::parse_bounded(&mut reader, None, Some(Endian::Big)).unwrap_err();
+
+        assert!(matches!(err, FatError::UnsortedHashes { .. }), "{err:?}");
+        let read = usize::try_from(reader.position()).unwrap();
+        assert!(
+            read <= FAT_COUNT_BYTES + HASH_CHECK_CHUNK_BYTES,
+            "read {read} bytes"
+        );
     }
 
     #[test]

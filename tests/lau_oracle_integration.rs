@@ -161,7 +161,8 @@ fn resolve_env_path(
 
 /// Opens the archive at `path`, naming it if that fails.
 fn open_archive(path: &Path) -> Bigfile {
-    Bigfile::open(path).unwrap_or_else(|e| panic!("Bigfile::open({}) failed: {e}", path.display()))
+    Bigfile::open(path)
+        .unwrap_or_else(|e| panic!("Bigfile::open({}) failed: {e:?}", path.display()))
 }
 
 fn test_archive_dir(spec: &OracleSpec) -> Option<PathBuf> {
@@ -174,7 +175,7 @@ fn test_filelist(spec: &OracleSpec) -> Option<HashDictionary> {
     let path = resolve_env_path(spec.filelist_env_var, val.as_deref(), oracles_required())?;
     let mut dict = HashDictionary::new();
     dict.load_file(&path)
-        .unwrap_or_else(|e| panic!("load_file({}) failed: {e}", path.display()));
+        .unwrap_or_else(|e| panic!("load_file({}) failed: {e:?}", path.display()));
     Some(dict)
 }
 
@@ -311,11 +312,11 @@ fn assert_patch_archive(bf: &Bigfile, expected_patch_entries: Option<usize>) {
         (Ok(patch_bf), None) => Some(patch_bf),
         (Err(BigfileError::NoPartsFound(_)), None) => None,
         (Err(e), Some(expected)) => panic!(
-            "expected patch.000 ({expected} entries) in '{}', but Bigfile::open failed: {e}",
+            "expected patch.000 ({expected} entries) in '{}', but Bigfile::open failed: {e:?}",
             bf.dir_path().display()
         ),
         (Err(e), None) => panic!(
-            "Bigfile::open({}) failed with unexpected error: {e}",
+            "Bigfile::open({}) failed with unexpected error: {e:?}",
             virtual_patch_path.display()
         ),
     };

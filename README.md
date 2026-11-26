@@ -21,29 +21,29 @@ This tool is feature complete and will receive long-term maintenance. Please rep
 - **Filename Hash Resolution:** Resolves `CRC-32/BZIP2` path hashes through filelists you supply with `--filelist`, with `__unknown/<hash>.bin` fallback naming. No filelists are bundled.
 - **Archive Inspection & Filtering:** Reports part geometry, hash resolution coverage, and specialisation flag distributions, and filters TOC entries by substring, glob pattern, unresolved status, or spec mask.
 - **Single-Asset & Parallel Unpacking:** Transparently inflates `zlib`-compressed payloads (or exports raw bytes) to `stdout`, a single file, or a sanitized directory tree across worker threads.
-- **Structured JSON Output:** Emits versioned `"schema": 2` JSON across all subcommands for scripting and `jq` pipelines.
+- **Structured JSON Output:** Emits versioned `"schema": 2` JSON from `info`, `list`, `hash`, `unpack`, and `extract -o <FILE>` for scripting and `jq` pipelines.
 
 ## Installation
 
 Each [release](https://github.com/EitrLicht/lau-bigfun-rs/releases) includes a standalone Windows x64 `lau-bigfun.exe` (no Visual C++ runtime needed), built from the tagged commit by this repository's release workflow. Verify a download with the GitHub CLI (signed in with `gh auth login`):
 
 ```bash
-gh attestation verify lau-bigfun-<version>-x86_64-pc-windows-msvc.zip --repo EitrLicht/lau-bigfun-rs --signer-workflow EitrLicht/lau-bigfun-rs/.github/workflows/release.yml
+gh attestation verify lau-bigfun-v<version>-x86_64-pc-windows-msvc.zip --repo EitrLicht/lau-bigfun-rs --signer-workflow EitrLicht/lau-bigfun-rs/.github/workflows/release.yml
 ```
 
 The executable is not code-signed, so Windows SmartScreen may warn the first time it runs.
 
-On any platform with Rust, install it from crates.io:
+On any platform with Rust, install it from crates.io, with `--locked` so it builds with the dependency versions the release was tested with:
 
 ```bash
-cargo install lau-bigfun
+cargo install --locked lau-bigfun
 ```
 
 Or build it from a checkout of this repository:
 
 ```bash
 # Install the `lau-bigfun` binary locally
-cargo install --path .
+cargo install --locked --path .
 
 # Or build in release mode (`target/release/lau-bigfun`)
 cargo build --release
@@ -70,7 +70,7 @@ What happens without a filelist depends on the command:
 | `list` or `unpack` with `--unresolved` | Warns and selects every entry. |
 | `list` | Warns and shows `<unknown>` for every name. |
 | `unpack` | Warns and writes every file to `__unknown/<hash>.bin`. |
-| `info` | Works, but reports 0% resolved names. |
+| `info` | Works, but reports no resolved names. |
 | `extract` | Works by path or hash, but `--json` reports a `null` name for a hash target. |
 | `hash` | Works, and does not use a filelist. |
 
@@ -123,9 +123,9 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 | Option | Description |
 | :--- | :--- |
 | `--endian <auto\|little\|big>` | TOC byte order (aliases `le`, `be`; default `auto`). Auto-detects `little` (PC/PS2/PSP/Xbox) vs. `big` (PS3/Xbox 360/Wii) from FAT and part geometry, or enforces the specified order strictly. |
-| `--segment-length <BYTES>` | Virtual segment stride in hex or decimal (e.g. `0x7ff00000` or `0x09600000`). Auto-detected from 1 MiB-aligned multi-part spill boundaries when omitted. A given value is used only if it is 1 MiB-aligned and every part file and record fits it. |
+| `--segment-length <BYTES>` | Virtual segment stride in hex or decimal (e.g. `0x7ff00000` or `0x09600000`). Auto-detected from 1 MiB-aligned multi-part spill boundaries when omitted; an archive that fits two lengths is refused until one is given. A given value is used only if it is 1 MiB-aligned and every part file and record fits it. |
 | `--single-part` | Open exactly the given file as one archive: no gathering of numbered `.000`, `.001`, ... parts and no `.dat` name resolution. For games whose numbered files are separate archives, each with its own TOC (e.g. `PATCH.000` and `PATCH.001`). Takes a file, not a directory; conflicts with `--segment-length`. |
-| `--filelist <FILE>` | Load a UTF-8 or Latin-1 filename list with one asset path per line, written as the game hashes it (e.g. `pc-w\lara.drm`). Blank lines and lines starting with `#` are ignored, and a file over 64 MiB is rejected. Repeatable, and later lists override earlier ones on a matching hash. See [Filelists](#filelists) for what each command does without one. |
+| `--filelist <FILE>` | Load a filename list in UTF-8, Latin-1, or UTF-16 with a byte order mark, with one asset path per line, written as the game hashes it (e.g. `pc-w\lara.drm`). Blank lines and lines starting with `#` are ignored. A file over 64 MiB is rejected, and so is a line holding a NUL character, as UTF-16 without a byte order mark does. Repeatable, and later lists override earlier ones on a matching hash. See [Filelists](#filelists) for what each command does without one. |
 
 ### Filtering & Extraction Options
 
@@ -141,9 +141,9 @@ lau-bigfun unpack /path/to/bigfile.000 -o ./unpacked --filelist names.txt --glob
 | `--variant-layout <MODE>` | `unpack` | Disambiguate colliding specialisation variants via `spec-dir` (default, `spec_<hex>/` when ambiguous), `always-spec-dir`, or `suffix` (`.spec_<hex>`). |
 | `--raw` | `extract`, `unpack` | Write raw on-disk bytes without inflating `zlib`-compressed payloads. |
 | `--max-output-bytes <BYTES>` | `unpack` | Refuse to start if the planned output exceeds this many bytes (hex or decimal; `0` for no limit). Defaults to 16 times the size of the archive on disk, since records can share stored bytes and expand far beyond it. This bounds expansion; free disk space is not checked. |
-| `--dry-run` | `unpack` | Report the files and bytes the unpack would write, without writing anything. The count is bytes written, not the disk space their blocks take up, and a planned output over `--max-output-bytes` is reported with a warning instead of refused. The destination is not checked, so a real unpack can still fail to create or write it, except that a destination that is a part file of the archive being read fails the dry run too. |
+| `--dry-run` | `unpack` | Report the files and bytes the unpack would write, without writing anything. The count is bytes written, not the disk space their blocks take up, and a planned output over `--max-output-bytes` is reported with a warning, which `--quiet` does not hide, instead of refused. The destination is not checked, so a real unpack can still fail to create or write it, except that a planned output file that is, or links to, a part file of the archive being read fails the dry run too. |
 
-`unpack` follows symbolic links already inside the output directory, except that a link to a directory on another filesystem fails, because files are moved into place from under the output directory.
+`unpack` follows symbolic links to directories already inside the output directory, except that a link to a directory on another filesystem fails, because files are moved into place from under the output directory. A symbolic link to a file where an output file goes is replaced by that file, not written through, unless it leads to a part file of the archive being read, which is refused.
 
 On Windows, an archive's parts cannot be written to or renamed while `lau-bigfun` has them open, and an archive that another program is writing, such as a game update in progress, will not open until it finishes.
 
@@ -152,7 +152,7 @@ On Windows, an archive's parts cannot be written to or renamed while `lau-bigfun
 | Option | Description |
 | :--- | :--- |
 | `--json` | Emit a versioned `"schema": 2` root object on `stdout` (`info`, `list`, `hash`, `unpack`, and `extract -o <FILE>`). Pretty-printed on TTYs, compact when piped; errors remain plain text on `stderr`. `extract` reports `name` from a path target or, for a hash target, from `--filelist`, and `variant` as the index among all variants of the hash (reproducible with `--variant <N>` alone). `list` reports `total_matching`, the entries that matched before `--limit`. With `--dry-run`, `unpack` adds `"dry_run": true`, and its counts are what it would write. |
-| `-q`, `--quiet` | Suppress non-error status messages on `stderr`. |
+| `-q`, `--quiet` | Suppress non-error status messages on `stderr`. A dry run still warns when its planned output is over `--max-output-bytes`. |
 
 ## Development
 
@@ -176,7 +176,7 @@ Parsers of untrusted input are fuzzed with `cargo-fuzz` on the nightly toolchain
 cargo +nightly fuzz run fat_parse
 ```
 
-When `fuzz/seeds/<target>` exists, pass it as a second corpus so the fuzzer starts from inputs that get past archive validation. The fuzzer writes new inputs to the first corpus, which must already exist:
+When `fuzz/seeds/<target>` exists, pass it as a second corpus so the fuzzer starts from inputs that get past archive validation; the fuzz crate's library tests check that the `archive_read` seeds still do. The fuzzer writes new inputs to the first corpus, which must already exist:
 
 ```bash
 mkdir -p fuzz/corpus/archive_read

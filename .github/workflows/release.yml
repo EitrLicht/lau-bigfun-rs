@@ -23,7 +23,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.99.1"
+  RUST_TOOLCHAIN: "1.100.0"
   CARGO_ABOUT_VERSION: "0.9.3"
   TARGET: x86_64-pc-windows-msvc
 

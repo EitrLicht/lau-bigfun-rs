@@ -15,8 +15,9 @@ use super::extract::{
 use super::output::*;
 use super::{execute_cli, output_limit, run_hash};
 use crate::test_support::{
-    ArchiveRecord, FailingWriter, FatRow, TempDir, build_ambiguous_part0, sample_entry,
-    write_archive, write_one_record_archives, write_shared_sector_archive,
+    ArchiveRecord, FailingWriter, FatRow, TempDir, assert_source_not_in_message,
+    build_ambiguous_part0, sample_entry, write_archive, write_one_record_archives,
+    write_shared_sector_archive, write_two_segment_length_archive,
 };
 
 mod args;
@@ -77,7 +78,8 @@ fn parse_extract_args(args: &[&str]) -> ExtractArgs {
     }
 }
 
-/// Runs the CLI on `args`, given without the program name, returning stdout and status text.
+/// Runs the CLI on `args`, given without the program name, returning stdout and status text, or
+/// the error as `main` prints it.
 fn exec_args(args: &[&str], stdout_is_tty: bool) -> Result<(Vec<u8>, String), String> {
     let cli = parse_args(args).unwrap();
     let mut out = Vec::new();
@@ -85,5 +87,5 @@ fn exec_args(args: &[&str], stdout_is_tty: bool) -> Result<(Vec<u8>, String), St
     let mut status = StatusReporter::new(&mut err, cli.quiet);
     execute_cli(cli, &mut out, stdout_is_tty, &mut status)
         .map(|()| (out, String::from_utf8(err).unwrap()))
-        .map_err(|e| e.to_string())
+        .map_err(|e| ErrorChain(e.as_ref()).to_string())
 }

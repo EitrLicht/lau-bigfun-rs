@@ -19,7 +19,8 @@ fn is_reserved_device(segment: &str) -> bool {
         .is_some_and(|port| {
             matches!(
                 port,
-                "1" | "2"
+                "0" | "1"
+                    | "2"
                     | "3"
                     | "4"
                     | "5"

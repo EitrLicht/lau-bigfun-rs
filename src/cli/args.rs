@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use lau_bigfun::{
     Bigfile, BigfileError, Endian, EntryFilter, FilterError, HashDictionary, OpenOptions,
-    VariantLayout, name_hash,
+    VariantLayout, name_hash, trim_name,
 };
 
 use super::output::StatusReporter;
@@ -16,10 +16,11 @@ use super::output::StatusReporter;
 #[command(
     name = "lau-bigfun",
     version,
-    about = "Tomb Raider LAU (Legend, Anniversary, Underworld) bigfile archive inspector and unpacker"
+    about = "Inspects and unpacks Legend-era Tomb Raider bigfile archives"
 )]
 pub(crate) struct Cli {
-    /// Suppress non-error status messages on stderr
+    /// Suppress non-error status messages on stderr (a dry run still warns when its planned output
+    /// is over --max-output-bytes)
     #[arg(short, long, global = true)]
     pub(crate) quiet: bool,
 
@@ -33,11 +34,13 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliVariantLayout {
-    /// Put unique hashes at `<out>/<path>` and multi-variant hashes under `<out>/spec_<hex>/<path>`
+    /// Put hashes with one selected variant at `<out>/<path>`, and those with several under
+    /// `<out>/spec_<hex>/<path>`
     SpecDir,
     /// Always put every entry under `<out>/spec_<hex>/<path>`
     AlwaysSpecDir,
-    /// Keep flat paths and append `.spec_<hex>` before the file extension when ambiguous
+    /// Keep entries at `<out>/<path>` and, for hashes with several selected variants, append
+    /// `.spec_<hex>` before the file extension
     Suffix,
 }
 
@@ -96,8 +99,9 @@ pub(crate) enum Commands {
 /// Shared CLI arguments for locating and opening a bigfile archive.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ArchiveArgs {
-    /// Path to the archive directory, its `.000` / `.dat` file, or a file of any other name, which
-    /// opens as one archive (as any file does with `--single-part`)
+    /// Path to a directory holding `bigfile.000`... or `bigfile.dat`, to any numbered part
+    /// (`.000`, `.001`, ...) or the `.dat` file, which gather every numbered part, or to a file of
+    /// any other name, which opens as one archive (as any file does with `--single-part`)
     pub(crate) archive: PathBuf,
 
     /// Override the virtual volume segment stride in bytes (hex or decimal, e.g. 0x7ff00000)
@@ -115,7 +119,8 @@ pub(crate) struct ArchiveArgs {
 }
 
 impl ArchiveArgs {
-    /// Opens the archive, naming the flag that settles an ambiguous byte order.
+    /// Opens the archive, naming the flag that settles an error it can, such as an ambiguous byte
+    /// order or segment length (see [`with_flag_hint`]).
     pub(crate) fn open(&self) -> Result<Bigfile, Box<dyn std::error::Error>> {
         let options = OpenOptions {
             segment_length: self.segment_length,
@@ -130,6 +135,7 @@ impl ArchiveArgs {
 pub(crate) fn with_flag_hint(err: BigfileError) -> Box<dyn std::error::Error> {
     let hint = match err {
         BigfileError::AmbiguousEndian => " with --endian little or --endian big",
+        BigfileError::AmbiguousSegmentLength { .. } => " with --segment-length",
         BigfileError::UndeterminedSegmentLength { .. } => {
             "; give it with --segment-length, or, if each numbered file is a separate archive, pass that file with --single-part"
         }
@@ -192,13 +198,19 @@ impl DictionaryArgs {
     ) -> Result<HashDictionary, Box<dyn std::error::Error>> {
         let dict = self.load()?;
         if dict.is_empty() {
+            let no_filelist = self.filelists.is_empty();
             if filter.is_some_and(EntryFilter::needs_names) {
-                return Err(
-                    "no filenames loaded, so this filter can only match hashes; pass --filelist <FILE> or filter on a hash such as 0x5ff91900"
-                        .into(),
-                );
+                let remedy = if no_filelist {
+                    "pass --filelist <FILE> or filter on a hash such as 0x5ff91900"
+                } else {
+                    "--filelist supplied no paths, so filter on a hash such as 0x5ff91900"
+                };
+                return Err(format!(
+                    "no filenames loaded, so this filter can only match hashes; {remedy}"
+                )
+                .into());
             }
-            let reason = if self.filelists.is_empty() {
+            let reason = if no_filelist {
                 "no filelist given; pass --filelist <FILE>"
             } else {
                 "--filelist supplied no paths"
@@ -379,8 +391,8 @@ pub(crate) struct UnpackArgs {
     #[arg(long, value_name = "BYTES", value_parser = parse_uint_auto::<u64>)]
     pub(crate) max_output_bytes: Option<u64>,
 
-    /// Report the files and bytes the unpack would write, without writing anything or checking the
-    /// destination
+    /// Report the files and bytes the unpack would write, without writing anything; only whether a
+    /// planned output file is, or links to, a part file of the archive being read is checked
     #[arg(long)]
     pub(crate) dry_run: bool,
 }
@@ -401,18 +413,16 @@ pub(crate) fn parse_uint_auto<T: TryFrom<u64>>(s: &str) -> Result<T, String> {
     let ty = std::any::type_name::<T>();
     let trimmed = s.trim();
     let val = match strip_hex_prefix(trimmed) {
-        Some(hex) => {
-            u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex {ty} '{s}': {e}"))
-        }
+        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex {ty}: {e}")),
         None => trimmed
             .parse::<u64>()
-            .map_err(|e| format!("invalid {ty} '{s}': {e}")),
+            .map_err(|e| format!("invalid {ty}: {e}")),
     }?;
-    T::try_from(val).map_err(|_| format!("{ty} '{s}' out of range"))
+    T::try_from(val).map_err(|_| format!("out of range for {ty}"))
 }
 
 pub(crate) fn parse_target_hash(target: &str) -> Result<(u32, Option<&str>), String> {
-    let trimmed = target.trim();
+    let trimmed = trim_name(target);
     if let Some(hex) = strip_hex_prefix(trimmed)
         && !hex.is_empty()
         && hex.len() <= 8

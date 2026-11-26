@@ -86,6 +86,15 @@ fn decode_latin1_bytes(filename: &str) -> Result<Vec<u8>, NonLatin1CharError> {
         .collect()
 }
 
+/// Removes leading and trailing whitespace from `name`, as [`str::trim`] does, except `U+0085`
+/// and the no-break space `U+00A0`. Those two are Latin-1, so they can be part of a name the game
+/// hashes; every other whitespace character is either ASCII padding or outside Latin-1, where no
+/// name can hold it.
+#[must_use]
+pub fn trim_name(name: &str) -> &str {
+    name.trim_matches(|c: char| c.is_whitespace() && !matches!(c, '\u{85}' | '\u{A0}'))
+}
+
 /// Computes the 32-bit LAU path hash of `filename` (case-insensitive for ASCII `'A'..='Z'`).
 ///
 /// `filename` must be Latin-1/ASCII encodable (`U+0000..=U+00FF`).
@@ -106,6 +115,13 @@ pub fn name_hash(filename: &str) -> Result<u32, NonLatin1CharError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_name_keeps_only_the_latin1_whitespace_a_name_can_hold() {
+        let padded = "\u{3000}\u{0B} \u{85}pc-w\\lara.drm\u{A0}\t\u{2003}";
+
+        assert_eq!(trim_name(padded), "\u{85}pc-w\\lara.drm\u{A0}");
+    }
 
     #[test]
     fn test_standard_crc32_bzip2_check_vector() {

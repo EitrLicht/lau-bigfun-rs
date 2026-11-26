@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 /// Converts an archive path (such as `pc-w\lara.drm` or `\tr8\assets\foo.png`) into a
 /// normalized, traversal-safe relative [`PathBuf`] suitable for joining onto an extraction directory.
 ///
-/// A `..` segment steps back out of the segment before it, the way a filesystem resolves it, so
+/// A `..` segment steps back out of the last segment kept so far, so
 /// `pc-w\sndstrm\..\cinstream\a.mul` becomes `pc-w/cinstream/a.mul`. So does a segment that is
-/// `..` once its surrounding spaces and control characters are trimmed, such as `.. `. At the
-/// start of the path there is nothing to step out of, so the result never climbs above the
-/// extraction directory.
+/// `..` once its surrounding spaces and control characters are trimmed, such as `.. `. A segment
+/// that sanitizing drops, such as `...` or one of only spaces, is not kept, so a `..` after it
+/// steps out of the segment before that one: `a\...\..\b` becomes `b`, where a filesystem would
+/// give `a/b`. With nothing kept to step out of, a `..` is dropped, so the result never climbs
+/// above the extraction directory.
 #[must_use]
 pub fn sanitize_relative_path(archive_path: &str) -> PathBuf {
     let mut out = PathBuf::new();
@@ -65,7 +67,8 @@ fn is_forbidden_filename_char(c: char) -> bool {
 
 /// Returns `true` if `segment`'s stem (before the first `'.'`, with trailing spaces and dots
 /// stripped) matches a Windows/NTFS reserved DOS device name (`CON`, `PRN`, `AUX`, `NUL`,
-/// `CONIN$`, `CONOUT$`, `COM1`–`COM9`, `LPT1`–`LPT9`, `COM¹`–`COM³`, `LPT¹`–`LPT³`).
+/// `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `LPT0`–`LPT9`, `COM¹`–`COM³`, `LPT¹`–`LPT³`), as Microsoft's
+/// file-naming documentation lists them.
 #[inline]
 fn is_windows_reserved_stem(segment: &str) -> bool {
     let stem = segment
@@ -80,7 +83,7 @@ fn is_windows_reserved_stem(segment: &str) -> bool {
             .iter()
             .any(|reserved| name.eq_ignore_ascii_case(reserved)),
         Some((prefix, number)) if is_port(prefix) => {
-            matches!(number.as_bytes(), [b'1'..=b'9'])
+            matches!(number.as_bytes(), [b'0'..=b'9'])
                 || matches!(number, "\u{00b9}" | "\u{00b2}" | "\u{00b3}")
         }
         _ => stem.eq_ignore_ascii_case("conin$") || stem.eq_ignore_ascii_case("conout$"),
@@ -258,6 +261,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parent_segment_steps_out_of_the_last_kept_segment() {
+        assert_eq!(sanitize_relative_path(r"a\...\..\b"), PathBuf::from("b"));
+    }
+
+    #[test]
     fn windows_key_ignores_the_verbatim_prefix() {
         assert_eq!(
             windows_path_key(Path::new(r"\\?\C:\Games\TR\bigfile.000")),
@@ -397,6 +405,14 @@ mod tests {
     }
 
     #[test]
+    fn port_zero_device_names_are_escaped() {
+        assert_eq!(
+            sanitize_relative_path(r"pc-w\com0.txt"),
+            PathBuf::from("pc-w/_com0.txt")
+        );
+    }
+
+    #[test]
     fn validates_windows_reserved_device_stems() {
         assert_eq!(trim_segment_affixes(" :foo.\t. "), "foo");
         assert_eq!(trim_segment_affixes(".\t."), "");
@@ -405,7 +421,9 @@ mod tests {
             "prn.txt",
             "Aux .drm",
             "nul..bin",
+            "com0.txt",
             "com1.tar.gz",
+            "LPT0",
             "LPT9",
             "com\u{00b9}.txt",
             "lpt\u{00b3}",
@@ -414,7 +432,7 @@ mod tests {
         ] {
             assert!(is_windows_reserved_stem(reserved));
         }
-        for normal in ["com", "com0", "com10", "console.drm", "lara.drm"] {
+        for normal in ["com", "com10", "lpt00", "console.drm", "lara.drm"] {
             assert!(!is_windows_reserved_stem(normal));
         }
     }

@@ -308,6 +308,29 @@ fn list_rejects_path_filter_without_filenames() {
 }
 
 #[test]
+fn list_path_filter_with_an_empty_filelist_says_it_supplied_no_paths() {
+    let (dir, archive_path) = create_synthetic_archive("list_path_filter_empty_list");
+    let filelist = dir.join("empty.txt");
+    fs::write(&filelist, "").unwrap();
+    let argv = [
+        "-q",
+        "list",
+        archive_path.to_str().unwrap(),
+        "--filelist",
+        filelist.to_str().unwrap(),
+        "--filter",
+        "lara",
+    ];
+
+    let err = exec_args(&argv, false).unwrap_err();
+
+    assert!(
+        err.ends_with("--filelist supplied no paths, so filter on a hash such as 0x5ff91900"),
+        "{err}"
+    );
+}
+
+#[test]
 fn list_rejects_substring_no_hash_label_contains_without_filenames() {
     let (_dir, archive_path) = create_synthetic_archive("list_non_label");
     let a = archive_path.to_str().unwrap();

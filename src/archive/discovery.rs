@@ -159,8 +159,8 @@ fn is_dat_extension(ext: &str) -> bool {
     ext.eq_ignore_ascii_case("dat")
 }
 
-/// Reads regular-file directory entries sorted by `(name_lower, name)` for deterministic
-/// case-insensitive matching across all filesystems without per-probe `stat` syscalls.
+/// Reads the directory entries that are, or may be, files (see [`may_be_file`]), sorted by
+/// `(name_lower, name)` for deterministic case-insensitive matching across all filesystems.
 ///
 /// A folder that does not exist has no entries. Any other failure to list it, including one
 /// partway through the listing, fails with [`BigfileError::ArchiveDirectory`], so a part is never
@@ -181,10 +181,7 @@ fn read_sorted_dir_entries(dir_path: &Path) -> Result<Vec<DirFileEntry>, Bigfile
 
     let mut entries: Vec<DirFileEntry> = listed
         .into_iter()
-        .filter(|e| {
-            e.file_type()
-                .is_ok_and(|ft| ft.is_file() || (ft.is_symlink() && e.path().is_file()))
-        })
+        .filter(may_be_file)
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             let name_lower = name.to_ascii_lowercase();
@@ -202,6 +199,20 @@ fn read_sorted_dir_entries(dir_path: &Path) -> Result<Vec<DirFileEntry>, Bigfile
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+
+/// Whether a directory entry is, or may be, a file: anything but a folder, a link to a folder or
+/// another kind of entry, such as a pipe. An entry whose type or link target cannot be read is
+/// kept, so that opening it as a part reports why with [`BigfileError::PartOpen`] instead of
+/// leaving the part out.
+fn may_be_file(entry: &fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_symlink() => {
+            !fs::metadata(entry.path()).is_ok_and(|target| !target.is_file())
+        }
+        Ok(file_type) => file_type.is_file(),
+        Err(_) => true,
+    }
 }
 
 /// Discovers sequential `<stem>.000`, `<stem>.001`, ... (`.000`..`.999`) part paths.
@@ -366,6 +377,22 @@ mod tests {
 
         assert!(
             matches!(&err, BigfileError::ArchiveDirectory { path, .. } if *path == not_a_folder),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_part_is_reported_not_left_out() {
+        let dir = TempDir::new("dangling_part_link");
+        write_one_empty_record(dir.join("bigfile.000"));
+        let link = dir.join("bigfile.001");
+        std::os::unix::fs::symlink(dir.join("missing.bin"), &link).unwrap();
+
+        let err = Bigfile::open(&dir).unwrap_err();
+
+        assert!(
+            matches!(&err, BigfileError::PartOpen { path, .. } if *path == link),
             "{err:?}"
         );
     }

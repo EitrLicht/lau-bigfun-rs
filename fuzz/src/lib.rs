@@ -5,6 +5,42 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Most part files an `archive_read` input describes (see [`write_archive_parts`]).
+pub const MAX_ARCHIVE_PARTS: usize = 3;
+
+/// Writes the part files of the archive that the `archive_read` input `data` describes to `dir`,
+/// as `bigfile.000` onwards, and removes any later parts an earlier input left there. Returns how
+/// many parts it wrote.
+///
+/// The input is a part count byte, taken modulo [`MAX_ARCHIVE_PARTS`] plus one. Then, for each
+/// part but the last, comes a little-endian `u16` length and that many bytes of the part (fewer if
+/// the input ends first). The last part is the rest of the input.
+///
+/// Returns `None` when the input is empty or ends before a length, or a part cannot be written.
+#[must_use]
+pub fn write_archive_parts(dir: &Path, data: &[u8]) -> Option<usize> {
+    let (&count, mut rest) = data.split_first()?;
+    let count = usize::from(count) % MAX_ARCHIVE_PARTS + 1;
+    for index in 0..MAX_ARCHIVE_PARTS {
+        let path = dir.join(format!("bigfile.{index:03}"));
+        if index >= count {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        let len = if index + 1 == count {
+            rest.len()
+        } else {
+            let (prefix, tail) = rest.split_first_chunk::<2>()?;
+            rest = tail;
+            usize::from(u16::from_le_bytes(*prefix)).min(rest.len())
+        };
+        let (part, tail) = rest.split_at(len);
+        rest = tail;
+        fs::write(path, part).ok()?;
+    }
+    Some(count)
+}
+
 /// Start of every scratch directory's name.
 const SCRATCH_PREFIX: &str = "lau_bigfun_fuzz_";
 
@@ -154,6 +190,28 @@ mod tests {
             .map(|name| root.join(format!("{SCRATCH_PREFIX}{name}")).exists());
         assert_eq!(kept, [true, false, true]);
         assert!(root.join("unrelated").exists());
+    }
+
+    #[test]
+    fn archive_read_seeds_open_as_archives() {
+        let seeds = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds/archive_read");
+        let mut opened = 0;
+        for seed in fs::read_dir(&seeds).unwrap() {
+            let seed = seed.unwrap().path();
+            let name = seed.file_name().unwrap().to_string_lossy().into_owned();
+            let root = TestRoot::new(&format!("seed-{name}"));
+            write_archive_parts(&root, &fs::read(&seed).unwrap()).unwrap();
+
+            let bf = lau_bigfun::Bigfile::open(root.join("bigfile.000"))
+                .unwrap_or_else(|err| panic!("seed {name} no longer opens: {err:?}"));
+
+            assert!(
+                !bf.entries().is_empty(),
+                "seed {name} opens with no entries"
+            );
+            opened += 1;
+        }
+        assert!(opened > 0, "no seeds in {}", seeds.display());
     }
 
     #[test]

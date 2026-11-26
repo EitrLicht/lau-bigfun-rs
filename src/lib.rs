@@ -1,4 +1,5 @@
-//! `lau-bigfun` — Tomb Raider LAU (*Legend*, *Anniversary*, *Underworld*) Bigfile reader and unpacker.
+//! `lau-bigfun` — library and CLI for reading and unpacking *Legend*-era *Tomb Raider* bigfile
+//! archives.
 //!
 //! Modules:
 //! - [`format`](mod@format) — Sector (`2048` B), block (`1 MiB`), and logical volume geometry.
@@ -70,9 +71,9 @@
 //! [`Bigfile::open_entry_at`] opens an entry's stored bytes from an offset instead, so several
 //! threads can each read their own part of one entry.
 
-// Docs of always-built items link to `filter` and `unpack` items. The default build, which CI
-// checks with broken links denied, resolves every link; without `unpack` those links render as
-// plain text instead of failing the build.
+// Docs of always-built items link to `filter` and `unpack` items. The default build resolves
+// every link, and its docs are checked with broken links denied; without `unpack` those links
+// render as plain text instead of failing the build.
 #![cfg_attr(not(feature = "unpack"), allow(rustdoc::broken_intra_doc_links))]
 
 pub mod archive;
@@ -94,7 +95,7 @@ pub use filelist::{FilelistError, HashDictionary, RelativeOutputPath};
 #[cfg(feature = "unpack")]
 pub use filter::{EntryFilter, FilterError};
 pub use format::{Endian, HexLabel};
-pub use hash::{NonLatin1CharError, name_hash, name_hash_bytes};
+pub use hash::{NonLatin1CharError, name_hash, name_hash_bytes, trim_name};
 #[cfg(feature = "unpack")]
 pub use unpack::{
     MAX_UNPACK_JOBS, UnpackOptions, UnpackReport, VariantLayout, extract_entry, unpack_archive,
@@ -120,8 +121,12 @@ mod non_exhaustive_guards {
     ///
     /// fn line(err: &FilelistError) -> Option<usize> {
     ///     match err {
-    ///         FilelistError::Io { .. } | FilelistError::TooLarge { .. } => None,
-    ///         FilelistError::InvalidFilename { line, .. } => Some(*line),
+    ///         FilelistError::Io { .. }
+    ///         | FilelistError::TooLarge { .. }
+    ///         | FilelistError::InvalidUtf16 { .. } => None,
+    ///         FilelistError::InvalidFilename { line, .. } | FilelistError::NulCharacter { line } => {
+    ///             Some(*line)
+    ///         }
     ///     }
     /// }
     /// ```

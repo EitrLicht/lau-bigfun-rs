@@ -7,7 +7,7 @@ use clap::Parser;
 
 mod cli;
 
-use cli::{Cli, StatusReporter, execute_cli, is_stdout_broken_pipe};
+use cli::{Cli, ErrorChain, StatusReporter, execute_cli, is_stdout_broken_pipe};
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
         if is_stdout_broken_pipe(err.as_ref()) {
             return ExitCode::SUCCESS;
         }
-        let _ = writeln!(io::stderr(), "error: {err}");
+        let _ = writeln!(io::stderr(), "error: {}", ErrorChain(err.as_ref()));
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

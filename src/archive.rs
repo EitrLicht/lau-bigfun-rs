@@ -28,13 +28,13 @@ pub use set::{ArchiveSet, ResolvedEntry};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BigfileError {
-    /// Reading the archive, its directory or an input file failed.
-    #[error("I/O error: {0}")]
+    /// Reading an entry's bytes from its part file failed.
+    #[error("I/O error")]
     Io(#[from] io::Error),
 
     /// The folder that holds the archive's parts could not be listed, such as for lack of
     /// permission.
-    #[error("cannot list archive folder '{path}': {source}")]
+    #[error("cannot list archive folder '{path}'")]
     ArchiveDirectory {
         /// Path of the folder.
         path: PathBuf,
@@ -45,7 +45,7 @@ pub enum BigfileError {
 
     /// A part file could not be opened, or its size or identity read. On Windows this includes a
     /// part that another program has open for writing.
-    #[error("cannot open archive part '{path}': {source}{}", discovery::sharing_hint(.source))]
+    #[error("cannot open archive part '{path}'{}", discovery::sharing_hint(.source))]
     PartOpen {
         /// Path of the part file.
         path: PathBuf,
@@ -55,12 +55,12 @@ pub enum BigfileError {
     },
 
     /// The destination rejected extracted bytes, as opposed to a failure reading the archive.
-    #[error("failed to write output: {0}")]
+    #[error("failed to write output")]
     Write(#[source] io::Error),
 
     /// An output file or directory could not be created, written or moved into place. Only
     /// unpacking (feature `unpack`) returns this.
-    #[error("failed to write '{path}': {source}")]
+    #[error("failed to write '{path}'")]
     OutputPath {
         /// The output file or directory.
         path: PathBuf,
@@ -132,7 +132,7 @@ pub enum BigfileError {
     },
 
     /// [`OpenOptions::segment_length`] differs from the segment length the records show, and the
-    /// archive's part files and records do not fit it.
+    /// archive's part files and records fit the one they show but not the one given.
     #[error(
         "explicit segment_length {override_length:#010x} does not fit the archive's part files and records; they show a segment stride of {detected_length:#010x}"
     )]
@@ -141,6 +141,19 @@ pub enum BigfileError {
         override_length: u64,
         /// The segment length detected from the records.
         detected_length: u64,
+    },
+
+    /// The archive's part files and records fit two segment lengths, and
+    /// [`OpenOptions::segment_length`] was not given to choose: the one detected from the first
+    /// record holding data past part 0, and a shorter one that starts part 1 at an empty record.
+    #[error(
+        "the archive fits a segment length of both {detected_length:#010x} and {other_length:#010x}; choose one explicitly"
+    )]
+    AmbiguousSegmentLength {
+        /// The segment length detected from the first record holding data past part 0.
+        detected_length: u64,
+        /// The other segment length the archive fits.
+        other_length: u64,
     },
 
     /// A part file is larger than the segment each part occupies.
@@ -245,7 +258,7 @@ pub enum BigfileError {
     },
 
     /// A compressed record's zlib stream is corrupt.
-    #[error("zlib decompression failed for record {index} (hash {}): {source}", HexLabel::new(*.name_hash))]
+    #[error("zlib decompression failed for record {index} (hash {})", HexLabel::new(*.name_hash))]
     DecompressError {
         /// Position of the record in the FAT.
         index: usize,
@@ -451,10 +464,11 @@ impl Bigfile {
     /// - [`BigfileError::PartOpen`] when a part file cannot be opened, or its size or identity
     ///   read, such as on Windows when another program has it open for writing.
     /// - [`BigfileError::ArchiveDirectory`] when the folder holding the parts cannot be listed.
-    /// - [`BigfileError::Io`] when reading the parts fails.
-    /// - [`BigfileError::Fat`] when the FAT does not parse.
+    /// - [`BigfileError::Fat`] when the FAT cannot be read or does not parse.
     /// - [`BigfileError::AmbiguousEndian`] when no byte order is given and the archive is valid
     ///   in both.
+    /// - [`BigfileError::AmbiguousSegmentLength`] when no segment length is given and the archive
+    ///   fits two.
     /// - A segment or record error, such as [`BigfileError::SegmentLengthMismatch`] or
     ///   [`BigfileError::RecordOverrunsPart`], when the parts do not fit the FAT.
     ///
@@ -469,9 +483,11 @@ impl Bigfile {
         let segment_length = options.segment_length;
         let open_as = |opening, endian| Self::open_as(opening, endian, segment_length);
         if let Some(endian) = options.endian {
-            return open_as(opening, endian)
+            let mut bigfile = open_as(opening, endian)
                 .map(|opened| opened.bigfile)
-                .map_err(|failed| failed.error.into_error());
+                .map_err(|failed| failed.error.into_error())?;
+            bigfile.reject_ambiguous_segment_length(segment_length)?;
+            return Ok(bigfile);
         }
         let Detected {
             value:
@@ -485,6 +501,7 @@ impl Bigfile {
         if let Some(other) = untried {
             bigfile.reject_ambiguous(other, &mut fat_bytes, segment_length)?;
         }
+        bigfile.reject_ambiguous_segment_length(segment_length)?;
         Ok(bigfile)
     }
 
@@ -841,9 +858,39 @@ mod tests {
     use super::*;
     use crate::format::{BLOCK_BYTE_COUNT, FAT_ENTRY_BYTES, SECTOR_BYTE_COUNT};
     use crate::test_support::{
-        ArchiveRecord, FatRow, TempDir, build_ambiguous_part0, build_part0_bytes, write_archive,
-        write_one_empty_record, write_one_record_archives, write_part0, write_two_part_archive,
+        ArchiveRecord, FatRow, TempDir, assert_source_not_in_message, build_ambiguous_part0,
+        build_part0_bytes, write_archive, write_one_empty_record, write_one_record_archives,
+        write_part0, write_two_part_archive, write_two_segment_length_archive,
     };
+
+    #[test]
+    fn messages_leave_the_wrapped_error_to_source() {
+        let cause = || io::Error::other("disk on fire");
+        let path = PathBuf::from("bigfile.000");
+        for err in [
+            BigfileError::Io(cause()),
+            BigfileError::ArchiveDirectory {
+                path: path.clone(),
+                source: cause(),
+            },
+            BigfileError::PartOpen {
+                path: path.clone(),
+                source: cause(),
+            },
+            BigfileError::Write(cause()),
+            BigfileError::OutputPath {
+                path: path.clone(),
+                source: cause(),
+            },
+            BigfileError::DecompressError {
+                index: 1,
+                name_hash: 0x5FF9_1900,
+                source: cause(),
+            },
+        ] {
+            assert_source_not_in_message::<io::Error>(&err);
+        }
+    }
 
     #[cfg(not(feature = "unpack"))]
     #[test]
@@ -1056,6 +1103,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn open_refuses_an_archive_that_fits_two_segment_lengths() {
+        let dir = TempDir::new("two_segment_lengths");
+        write_two_segment_length_archive(&dir);
+        let block = u64::from(BLOCK_BYTE_COUNT);
+
+        let err = Bigfile::open(&dir).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BigfileError::AmbiguousSegmentLength { detected_length, other_length }
+                    if detected_length == 3 * block && other_length == 2 * block
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_byte_order_still_refuses_an_archive_that_fits_two_segment_lengths() {
+        let dir = TempDir::new("two_segment_lengths_endian");
+        write_two_segment_length_archive(&dir);
+
+        let options = OpenOptions {
+            segment_length: None,
+            endian: Some(Endian::Little),
+            single_part: false,
+        };
+        let err = Bigfile::open_with_options(&dir, options).unwrap_err();
+
+        assert!(
+            matches!(err, BigfileError::AmbiguousSegmentLength { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_segment_length_that_fits_neither_of_two_is_not_blamed_on_either() {
+        let dir = TempDir::new("two_segment_lengths_misfit");
+        write_two_segment_length_archive(&dir);
+
+        let options = OpenOptions {
+            segment_length: Some(u64::from(BLOCK_BYTE_COUNT)),
+            endian: None,
+            single_part: false,
+        };
+        let err = Bigfile::open_with_options(&dir, options).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BigfileError::PartExceedsSegmentLength { part_index: 0, .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_segment_length_chooses_between_two_that_fit() {
+        let dir = TempDir::new("two_segment_lengths_override");
+        write_two_segment_length_archive(&dir);
+        let stride = 2 * u64::from(BLOCK_BYTE_COUNT);
+
+        let options = OpenOptions {
+            segment_length: Some(stride),
+            endian: None,
+            single_part: false,
+        };
+        let bf = Bigfile::open_with_options(&dir, options).unwrap();
+
+        assert_eq!(bf.segment_length(), Some(stride));
+    }
+
     /// Writes to `dir` a two-part archive split every 2 MiB whose part 1 starts with an empty
     /// record and holds its first data one sector later, so the smallest data offset past part 0
     /// is not block-aligned.
@@ -1107,6 +1227,32 @@ mod tests {
             Bigfile::open(&dir).unwrap_err(),
             BigfileError::UnalignedSegmentLength { .. }
         ));
+    }
+
+    #[test]
+    fn explicit_segment_length_reports_its_own_error_when_the_detected_one_does_not_fit() {
+        let dir = TempDir::new("override_and_detected_misfit");
+        write_part1_starting_with_empty_record(&dir);
+        let block = u64::from(BLOCK_BYTE_COUNT);
+
+        let options = OpenOptions {
+            segment_length: Some(block),
+            endian: None,
+            single_part: false,
+        };
+        let err = Bigfile::open_with_options(&dir, options).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BigfileError::MissingPartStartEntry {
+                    part_index: 1,
+                    expected_sector: 512,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

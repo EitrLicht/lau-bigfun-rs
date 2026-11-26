@@ -11,9 +11,64 @@ impl Bigfile {
         segment_length_override: Option<u64>,
     ) -> Result<(), BigfileError> {
         self.segment_length = self.resolve_segment_length(segment_length_override)?;
+        self.validate_layout()
+            .map_err(|err| self.override_mismatch_or(segment_length_override, err))
+    }
+
+    /// Validates the part files and records under the current `segment_length`.
+    fn validate_layout(&self) -> Result<(), BigfileError> {
         self.validate_part_starts()
             .and_then(|()| self.validate_records_fit())
-            .map_err(|err| self.override_mismatch_or(segment_length_override, err))
+    }
+
+    /// Whether the archive's part files and records would fit a segment length of `candidate`,
+    /// leaving the current one in place.
+    fn fits_segment_length(&mut self, candidate: u64) -> bool {
+        if Self::validate_segment_length(candidate).is_err() {
+            return false;
+        }
+        let current = self.segment_length.replace(candidate);
+        let fits = self.validate_layout().is_ok();
+        self.segment_length = current;
+        fits
+    }
+
+    /// Fails with [`BigfileError::AmbiguousSegmentLength`] when no segment length was given and
+    /// the archive, opened with the one it detected, also fits the shorter one that starts part 1
+    /// at the first record of any size at or past part 0's end. Detection skips empty records
+    /// there, since one can sit exactly at part 0's end, but one can also be the first record of
+    /// part 1, and then both readings may fit. Runs once the byte order is settled, so that it
+    /// cannot steer byte-order detection.
+    pub(super) fn reject_ambiguous_segment_length(
+        &mut self,
+        segment_length_override: Option<u64>,
+    ) -> Result<(), BigfileError> {
+        let (None, Some(detected_length)) = (segment_length_override, self.segment_length) else {
+            return Ok(());
+        };
+        match self.other_fitting_segment_length(detected_length) {
+            Some(other_length) => Err(BigfileError::AmbiguousSegmentLength {
+                detected_length,
+                other_length,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The segment length other than `detected_length` that the archive also fits, if any: the
+    /// one that starts part 1 at the first record of any size at or past part 0's end (see
+    /// [`Self::reject_ambiguous_segment_length`]).
+    fn other_fitting_segment_length(&mut self, detected_length: u64) -> Option<u64> {
+        let part0_size = self.part_sizes[0];
+        self.fat
+            .entries()
+            .iter()
+            .map(Entry::logical_offset)
+            .filter(|&logical| logical >= part0_size)
+            .min()
+            .filter(|&other_length| {
+                other_length != detected_length && self.fits_segment_length(other_length)
+            })
     }
 
     /// Resolves the per-part logical segment stride: an explicit override as given once it is
@@ -42,10 +97,11 @@ impl Bigfile {
     }
 
     /// Returns [`BigfileError::SegmentLengthMismatch`] in place of `err` when the archive did not
-    /// fit an explicit override that differs from the stride its records show, and `err` itself
-    /// otherwise.
+    /// fit an explicit override but does fit the different stride its records show, and fits no
+    /// other, and `err` itself otherwise: when the archive fits neither, or fits that stride and
+    /// another one too, so that naming it could steer the caller to the wrong one.
     fn override_mismatch_or(
-        &self,
+        &mut self,
         segment_length_override: Option<u64>,
         err: BigfileError,
     ) -> BigfileError {
@@ -54,6 +110,8 @@ impl Bigfile {
             && let Some(detected_length) =
                 Self::first_spill_offset(self.fat.entries(), self.part_sizes[0])
             && detected_length != override_length
+            && self.fits_segment_length(detected_length)
+            && self.other_fitting_segment_length(detected_length).is_none()
         {
             return BigfileError::SegmentLengthMismatch {
                 override_length,
@@ -120,8 +178,8 @@ impl Bigfile {
         Ok(())
     }
 
-    /// Validates that no physical part exceeds `segment_length` and every part `k >= 1` begins at
-    /// offset 0 with some entry's data.
+    /// Validates that no physical part exceeds `segment_length` and every part `k >= 1` has at least
+    /// one entry starting at its offset 0.
     fn validate_part_starts(&self) -> Result<(), BigfileError> {
         self.validate_parts_within_segment_length()?;
         match self.segment_length {

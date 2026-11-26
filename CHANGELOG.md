@@ -2,6 +2,37 @@
 
 Notable changes to `lau-bigfun`, newest first. Versions not listed here were never published.
 
+## 0.5.2 - 2026-11-26
+
+### Added
+
+- `FilelistError::NulCharacter` and `FilelistError::InvalidUtf16`, for the filelist cases under **Fixed**.
+- `BigfileError::AmbiguousSegmentLength`, for the segment-length case under **Fixed**.
+- `trim_name` trims the whitespace around a name the way filelists and the command-line tool's `extract` and `hash` do: like `str::trim`, but keeping `U+0085` and the no-break space `U+00A0`, which a name can hold.
+
+### Changed
+
+- The crate's description, its documentation's first line and the command-line tool's `about` text describe *Legend*-era *Tomb Raider* bigfile archives instead of listing three of the games: the description and documentation say "reading and unpacking", the `about` text "Inspects and unpacks".
+- `COM0` and `LPT0`, which Microsoft's file-naming documentation lists as reserved device names, are escaped like `COM1`–`COM9` and `LPT1`–`LPT9`: an entry named `com0.txt` unpacks as `_com0.txt`. None of the retail PC filelists has such a name.
+- Error messages no longer repeat their source when the source chain is printed, for example by `anyhow`'s `{:#}`: each error that wraps another still returns it from `source()`, but leaves it out of its own message. **Code that prints only an error's message (`{err}`) no longer shows the cause, such as the OS error, so print the `source()` chain to keep it.** The command-line tool now prints the chain, so its output is unchanged, except that on Windows the hint about a part another program has open now comes before the OS error, and an invalid `--glob` pattern is reported as `invalid glob pattern '<pattern>': error parsing glob '<normalized pattern>': <reason>`, where the normalized pattern has `/` separators and no leading slash.
+
+### Fixed
+
+- A filelist saved as UTF-16 with a byte order mark, as Windows PowerShell 5.1 writes with `>`, loads its names; it loaded without an error but named nothing. One that starts with the mark but isn't valid UTF-16 fails with `FilelistError::InvalidUtf16`.
+- A filelist line holding a NUL character fails with `FilelistError::NulCharacter` at that line, since no name can hold one. That catches UTF-16 without a byte order mark, which also loaded as names that matched nothing.
+- A lone carriage return ends a filelist line, as `\n` and `\r\n` do, so a file with classic Mac line endings no longer loads as one name.
+- Opening a multi-part archive without a segment length no longer silently picks one of two that fit, which read the wrong bytes for some records. That happens when part 0 is a multiple of 1 MiB and has an empty record exactly at its end, and part 1's first data lies further in. Such an archive now fails with `AmbiguousSegmentLength`. **An archive that opened before may now fail this way; choose the length with `OpenOptions::segment_length`.** The command-line tool asks for `--segment-length`. The three retail PC archives are unaffected.
+- Detecting the byte order no longer briefly needs several times part 0's size in memory when the archive's entry count, read in the other byte order, also fits part 0: hash order is now checked as the hashes are read, so the wrong reading fails within 64 KiB once its hashes are out of order, as a misread table's almost always are. A crafted 152 MB part 0 peaked at 513 MB before and 5 MB now; the retail PC archives were never affected.
+- The `<ARCHIVE>` help says that any numbered part, not only `.000`, gathers every part of the archive.
+- An explicit segment length that doesn't fit reports `SegmentLengthMismatch` only when the archive fits the segment length its records show, and no other. Otherwise the archive's own error is reported, instead of being blamed on the override.
+- A numbered part that is a symbolic link whose target can't be read, such as a dangling link, is reported with `BigfileError::PartOpen` instead of being left out, which opened the archive with fewer parts and gave a misleading record error.
+- Filelist lines and `extract`'s path target no longer lose a no-break space (`U+00A0`) or `U+0085` at either end. Both are Latin-1, so a name can hold them, and trimming them made the name hash differently from the game's. Other whitespace is still trimmed.
+- `hash` trims each name as filelists and `extract` do, so all three give the same hash for the same text; it hashed a padded name untrimmed.
+- Glob patterns that are each valid but too large to compile together are reported as such, instead of as the invalid pattern `'<globset>'`.
+- A path filter with filelists that supplied no paths no longer advises passing `--filelist`, and a bad numeric argument no longer names its value twice.
+- `unpack --dry-run --quiet` now still warns when the planned output is over `--max-output-bytes`. The warning stands in for the error a real unpack gives, so `--quiet` no longer hides it.
+- Documentation that disagreed with the code: the README's install commands now pass `--locked`, so they build with the dependency versions the release was tested with, and its feature list names the commands that emit JSON instead of claiming all of them; the README's command for verifying a download now names the file as released (`lau-bigfun-v<version>-x86_64-pc-windows-msvc.zip`); `unpack --dry-run`'s help and the README no longer say the destination goes unchecked: a planned output file that is, or links to, an archive part fails the dry run; `--variant-layout`'s help no longer says `suffix` keeps flat paths; `info` without a filelist reports no resolved names rather than 0%, which an empty archive shows as 100%; and the README and `unpack_archive` now say that a symbolic link to a file where an output file goes is replaced by the file, not written through, unless it leads to an archive part.
+
 ## 0.5.1 - 2026-11-19
 
 ### Fixed

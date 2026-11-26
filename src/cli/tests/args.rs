@@ -36,6 +36,20 @@ fn ambiguous_endian_error_names_the_flag() {
 }
 
 #[test]
+fn ambiguous_segment_length_error_names_the_flag() {
+    let dir = TempDir::new("ambiguous_stride");
+    write_two_segment_length_archive(&dir);
+
+    let argv = ["info", dir.to_str().unwrap()];
+    let err = exec_args(&argv, false).unwrap_err();
+
+    assert!(
+        err.ends_with("choose one explicitly with --segment-length"),
+        "{err}"
+    );
+}
+
+#[test]
 fn undetermined_segment_length_error_names_single_part() {
     let dir = TempDir::new("undetermined_stride");
     write_one_record_archives(&dir, &[("bigfile.000", 0x1000), ("bigfile.001", 0x2000)]);
@@ -133,7 +147,7 @@ fn numeric_parsers_accept_decimal_or_hex_values() {
     assert!(
         parse_uint_auto::<u32>("0x100000000")
             .unwrap_err()
-            .contains("u32 '0x100000000' out of range")
+            .contains("out of range for u32")
     );
 
     assert_eq!(parse_uint_auto::<u64>("0x7ff00000").unwrap(), 0x7FF0_0000);
@@ -173,6 +187,16 @@ fn parse_target_hash_distinguishes_hex_hashes_from_paths() {
         (0x5FF9_1900, Some(r"pc-w\lara.drm"))
     );
     assert!(parse_target_hash("pc-w\\\u{0100}.drm").is_err());
+}
+
+#[test]
+fn parse_target_hash_trims_padding_but_keeps_latin1_whitespace() {
+    let name = "\u{85}pc-w\\lara.drm\u{a0}";
+    let target = format!("\u{3000} {name}\t\u{0B}");
+
+    let parsed = parse_target_hash(&target).unwrap();
+
+    assert_eq!(parsed, (name_hash(name).unwrap(), Some(name)));
 }
 
 #[test]

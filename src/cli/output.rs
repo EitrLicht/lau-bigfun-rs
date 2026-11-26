@@ -9,7 +9,7 @@ use thiserror::Error;
 
 /// Error wrapper tagging I/O failures originating from `stdout` writes or flushes.
 #[derive(Debug, Error)]
-#[error("failed to write to stdout: {0}")]
+#[error("failed to write to stdout")]
 pub(crate) struct StdoutError(#[from] pub(crate) io::Error);
 
 impl StdoutError {
@@ -23,6 +23,20 @@ impl StdoutError {
 pub(crate) fn is_stdout_broken_pipe(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<StdoutError>()
         .is_some_and(StdoutError::is_broken_pipe)
+}
+
+/// Displays an error followed by each error in its [`source`](std::error::Error::source) chain,
+/// joined with `": "`, as the CLI reports a failure.
+pub(crate) struct ErrorChain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        for cause in std::iter::successors(self.0.source(), |err| err.source()) {
+            write!(f, ": {cause}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Version of the `--json` output's shape, written as its `"schema"` field. One version covers

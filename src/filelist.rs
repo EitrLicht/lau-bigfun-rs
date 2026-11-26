@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::hash::{NonLatin1CharError, name_hash};
+use crate::hash::{NonLatin1CharError, name_hash, trim_name};
 use crate::path::sanitize_relative_path;
 
 /// Errors that can occur when loading a filelist from disk or string.
@@ -17,7 +17,7 @@ use crate::path::sanitize_relative_path;
 #[non_exhaustive]
 pub enum FilelistError {
     /// The filelist file could not be read.
-    #[error("failed to read filelist '{path}': {source}")]
+    #[error("failed to read filelist '{path}'")]
     Io {
         /// Path of the filelist.
         path: PathBuf,
@@ -37,13 +37,31 @@ pub enum FilelistError {
     },
 
     /// A line holds a name that cannot be hashed.
-    #[error("invalid filename on line {line}: {source}")]
+    #[error("invalid filename on line {line}")]
     InvalidFilename {
         /// Line number, counting from 1.
         line: usize,
         /// Why the name cannot be hashed.
         #[source]
         source: NonLatin1CharError,
+    },
+
+    /// A line holds a NUL character, which no name the game looks up can hold. A UTF-16 file
+    /// without a byte order mark has one on every line, and so do UTF-32 and most binary data.
+    #[error(
+        "line {line} holds a NUL character, which no filename can; the filelist may be UTF-16 without a byte order mark, UTF-32, or not text"
+    )]
+    NulCharacter {
+        /// Line number, counting from 1.
+        line: usize,
+    },
+
+    /// The file starts with a UTF-16 byte order mark, but what follows is not valid UTF-16: it
+    /// has an odd number of bytes or an unpaired surrogate.
+    #[error("'{path}' starts with a UTF-16 byte order mark but is not valid UTF-16")]
+    InvalidUtf16 {
+        /// Path of the filelist.
+        path: PathBuf,
     },
 }
 
@@ -78,16 +96,22 @@ impl HashDictionary {
 
     /// Parses and inserts newline-delimited asset paths from `content`.
     ///
-    /// Blank lines and lines starting with `#` (after stripping any leading UTF-8 BOM and
-    /// whitespace) are ignored. Returns the number of entries parsed.
+    /// A line ends at `\n`, `\r\n` or a lone `\r`. Each line loses a leading UTF-8 BOM and is
+    /// trimmed with [`trim_name`], so whitespace around a name goes but `U+0085` and the no-break
+    /// space (`U+00A0`) stay part of it. Blank lines and lines starting with `#` are then ignored.
+    /// Returns the number of entries parsed.
     ///
     /// # Errors
     ///
-    /// [`FilelistError::InvalidFilename`] at the first line holding a character above `U+00FF`.
-    /// The lines before it stay loaded.
+    /// Fails at the first line that holds a NUL character, with [`FilelistError::NulCharacter`],
+    /// or a character above `U+00FF`, with [`FilelistError::InvalidFilename`]; comment lines
+    /// count for the NUL. The lines before it stay loaded.
     pub fn load_str(&mut self, content: &str) -> Result<usize, FilelistError> {
         let mut loaded = 0usize;
-        for (idx, raw_line) in content.lines().enumerate() {
+        for (idx, raw_line) in Self::filelist_lines(content).enumerate() {
+            if raw_line.contains('\0') {
+                return Err(FilelistError::NulCharacter { line: idx + 1 });
+            }
             let Some(line) = Self::parse_filelist_line(raw_line) else {
                 continue;
             };
@@ -118,11 +142,19 @@ impl HashDictionary {
         }
     }
 
-    /// Strips any leading UTF-8 BOM (`U+FEFF`), trims whitespace, and returns `None` if the line
-    /// is blank or starts with `#`.
+    /// Splits `content` into lines ending at `\n`, `\r\n` or a lone `\r`, so a file saved with
+    /// classic Mac line endings is read line by line too.
+    fn filelist_lines(content: &str) -> impl Iterator<Item = &str> {
+        content
+            .split('\n')
+            .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+    }
+
+    /// Strips any leading UTF-8 BOM (`U+FEFF`), trims the line with [`trim_name`], and returns
+    /// `None` if it is blank or starts with `#`.
     #[inline]
     fn parse_filelist_line(raw_line: &str) -> Option<&str> {
-        let line = raw_line.strip_prefix('\u{FEFF}').unwrap_or(raw_line).trim();
+        let line = trim_name(raw_line.strip_prefix('\u{FEFF}').unwrap_or(raw_line));
         if line.is_empty() || line.starts_with('#') {
             None
         } else {
@@ -130,12 +162,15 @@ impl HashDictionary {
         }
     }
 
-    /// Loads and merges newline-delimited asset paths from a UTF-8 or Latin-1 file on disk.
+    /// Loads and merges newline-delimited asset paths from a file on disk: UTF-16 when it starts
+    /// with a UTF-16 byte order mark, and otherwise UTF-8, with any line that isn't valid UTF-8
+    /// read as Latin-1.
     ///
     /// # Errors
     ///
     /// [`FilelistError::Io`] when the file cannot be read, [`FilelistError::TooLarge`] when it is
-    /// over 64 MiB, and otherwise fails like [`Self::load_str`].
+    /// over 64 MiB, [`FilelistError::InvalidUtf16`] when it starts with a UTF-16 byte order mark
+    /// but is not valid UTF-16, and otherwise fails like [`Self::load_str`].
     pub fn load_file<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, FilelistError> {
         let path = path.as_ref();
         let mut bytes = Vec::new();
@@ -151,10 +186,38 @@ impl HashDictionary {
                 limit: MAX_FILELIST_BYTES,
             });
         }
+        if let Some(utf16) = Self::decode_utf16_with_bom(&bytes, path) {
+            return self.load_str(&utf16?);
+        }
         match String::from_utf8(bytes) {
             Ok(text) => self.load_str(&text),
             Err(err) => self.load_str(&Self::decode_filelist_bytes(err.as_bytes())),
         }
+    }
+
+    /// Decodes the filelist `bytes` read from `path` as UTF-16 when they start with a UTF-16 byte
+    /// order mark: `FF FE` for little-endian, as Windows PowerShell 5.1 writes with `>`, or
+    /// `FE FF` for big-endian. Returns `None` for bytes without one, and
+    /// [`FilelistError::InvalidUtf16`] when what follows the mark is not valid UTF-16. No UTF-8
+    /// file starts with the mark, and a Latin-1 one would only if its first name began `ÿþ`.
+    fn decode_utf16_with_bom(bytes: &[u8], path: &Path) -> Option<Result<String, FilelistError>> {
+        let (body, from_bytes): (_, fn([u8; 2]) -> u16) = match bytes {
+            [0xFF, 0xFE, body @ ..] => (body, u16::from_le_bytes),
+            [0xFE, 0xFF, body @ ..] => (body, u16::from_be_bytes),
+            _ => return None,
+        };
+        let invalid = || FilelistError::InvalidUtf16 {
+            path: path.to_path_buf(),
+        };
+        let (units, rest) = body.as_chunks::<2>();
+        if !rest.is_empty() {
+            return Some(Err(invalid()));
+        }
+        Some(
+            char::decode_utf16(units.iter().map(|&unit| from_bytes(unit)))
+                .collect::<Result<String, _>>()
+                .map_err(|_| invalid()),
+        )
     }
 
     /// Decodes filelist bytes line by line after dropping a leading UTF-8 BOM: each line is read
@@ -163,7 +226,7 @@ impl HashDictionary {
     fn decode_filelist_bytes(bytes: &[u8]) -> String {
         let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
         let mut text = String::with_capacity(body.len());
-        for line in body.split_inclusive(|&b| b == b'\n') {
+        for line in body.split_inclusive(|&b| b == b'\n' || b == b'\r') {
             match std::str::from_utf8(line) {
                 Ok(utf8) => text.push_str(utf8),
                 Err(_) => text.extend(line.iter().copied().map(char::from)),
@@ -217,7 +280,126 @@ mod tests {
 
     use super::*;
     use crate::hash::name_hash_bytes;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, assert_source_not_in_message};
+
+    #[test]
+    fn messages_leave_the_wrapped_error_to_source() {
+        let dir = TempDir::new("filelist_source");
+        let mut dict = HashDictionary::new();
+
+        let read_err = dict.load_file(dir.join("missing.txt")).unwrap_err();
+        let name_err = dict.load_str("pc-w\\\u{0100}.drm").unwrap_err();
+
+        assert_source_not_in_message::<io::Error>(&read_err);
+        assert_source_not_in_message::<NonLatin1CharError>(&name_err);
+    }
+
+    /// Encodes `text` as UTF-16 with `encode` (`u16::to_le_bytes` or `u16::to_be_bytes`), after
+    /// the byte order mark `bom`.
+    fn utf16_bytes(bom: &[u8], encode: fn(u16) -> [u8; 2], text: &str) -> Vec<u8> {
+        let mut bytes = bom.to_vec();
+        bytes.extend(text.encode_utf16().flat_map(encode));
+        bytes
+    }
+
+    /// Writes `bytes` to `filelist.txt` in `dir` and loads it into `dict`.
+    fn load_filelist_bytes(
+        dict: &mut HashDictionary,
+        dir: &TempDir,
+        bytes: &[u8],
+    ) -> Result<usize, FilelistError> {
+        let path = dir.join("filelist.txt");
+        fs::write(&path, bytes).unwrap();
+        dict.load_file(&path)
+    }
+
+    #[test]
+    fn loads_utf16_with_either_byte_order_mark() {
+        let dir = TempDir::new("filelist_utf16");
+        let text = "# comment\r\npc-w\\lara.drm\r\n";
+
+        for bytes in [
+            utf16_bytes(&[0xFF, 0xFE], u16::to_le_bytes, text),
+            utf16_bytes(&[0xFE, 0xFF], u16::to_be_bytes, text),
+        ] {
+            let mut dict = HashDictionary::new();
+
+            let loaded = load_filelist_bytes(&mut dict, &dir, &bytes);
+
+            assert_eq!(loaded.unwrap(), 1);
+            assert_eq!(dict.get(0x5FF9_1900), Some(r"pc-w\lara.drm"));
+        }
+    }
+
+    #[test]
+    fn rejects_utf16_without_a_byte_order_mark_at_line_one() {
+        let dir = TempDir::new("filelist_utf16_no_bom");
+        let bytes = utf16_bytes(&[], u16::to_le_bytes, "pc-w\\lara.drm\r\n");
+
+        let loaded = load_filelist_bytes(&mut HashDictionary::new(), &dir, &bytes);
+
+        assert!(
+            matches!(loaded, Err(FilelistError::NulCharacter { line: 1 })),
+            "{loaded:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_utf16_that_does_not_decode() {
+        let dir = TempDir::new("filelist_bad_utf16");
+        let path = dir.join("filelist.txt");
+        let unpaired_surrogate = [0xFF, 0xFE, 0x00, 0xD8, b'a', 0x00];
+        let odd_length = [0xFF, 0xFE, b'a', 0x00, b'b'];
+
+        for bytes in [&unpaired_surrogate[..], &odd_length] {
+            let loaded = load_filelist_bytes(&mut HashDictionary::new(), &dir, bytes);
+
+            assert!(
+                matches!(&loaded, Err(FilelistError::InvalidUtf16 { path: p }) if *p == path),
+                "{loaded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_a_nul_at_its_line_after_loading_the_lines_before() {
+        let mut dict = HashDictionary::new();
+
+        let err = dict.load_str("pc-w\\lara.drm\n# not\0text\n").unwrap_err();
+
+        assert!(
+            matches!(err, FilelistError::NulCharacter { line: 2 }),
+            "{err:?}"
+        );
+        assert_eq!(dict.get(0x5FF9_1900), Some(r"pc-w\lara.drm"));
+    }
+
+    #[test]
+    fn splits_lines_at_a_lone_carriage_return() {
+        let mut dict = HashDictionary::new();
+
+        assert_eq!(dict.load_str("pc-w\\a.drm\rpc-w\\b.drm\r").unwrap(), 2);
+    }
+
+    #[test]
+    fn counts_lines_across_mixed_line_endings() {
+        let mut dict = HashDictionary::new();
+
+        let err = dict.load_str("a\r\nb\rc\n\r\n\u{0100}\n").unwrap_err();
+
+        assert!(
+            matches!(err, FilelistError::InvalidFilename { line: 5, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn decodes_each_carriage_return_line_in_its_own_encoding() {
+        assert_eq!(
+            HashDictionary::decode_filelist_bytes(b"pc-w\\a\xc3\xa9.drm\rpc-w\\b\xe9.drm"),
+            "pc-w\\a\u{e9}.drm\rpc-w\\b\u{e9}.drm"
+        );
+    }
 
     #[test]
     fn loads_custom_filelist_with_bom() {
@@ -233,6 +415,17 @@ mod tests {
         assert_eq!(dict.get(0x5FF9_1900), Some(r"PC-W\LARA.DRM"));
         dict.load_str("pc-w\\lara.drm\n").unwrap();
         assert_eq!(dict.get(0x5FF9_1900), Some(r"pc-w\lara.drm"));
+    }
+
+    #[test]
+    fn trims_padding_but_keeps_latin1_whitespace_in_a_name() {
+        let mut dict = HashDictionary::new();
+        let name = "\u{85}pc-w\\lara.drm\u{a0}";
+
+        dict.load_str(&format!("\u{3000} {name}\t\u{0B}\r\n"))
+            .unwrap();
+
+        assert_eq!(dict.get(name_hash(name).unwrap()), Some(name));
     }
 
     #[test]

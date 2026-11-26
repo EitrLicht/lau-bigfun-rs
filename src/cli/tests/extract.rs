@@ -291,6 +291,46 @@ fn extract_json_writes_file_payload_with_stdout_metadata() {
 }
 
 #[test]
+fn extract_json_variant_selects_the_same_record_without_the_spec_mask() {
+    let (dir, archive_path) = create_three_variant_archive("extract_json_variant");
+    let (a, out) = (archive_path.to_str().unwrap(), dir.join("lara.drm"));
+    let o = out.to_str().unwrap();
+    let masked = [
+        "extract",
+        a,
+        r"pc-w\lara.drm",
+        "-o",
+        o,
+        "--json",
+        "--spec-mask",
+        "0x3",
+        "--variant",
+        "1",
+    ];
+    let (stdout, _) = exec_args(&masked, false).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let masked_bytes = fs::read(&out).unwrap();
+
+    let variant = report["variant"].as_u64().unwrap().to_string();
+    exec_args(
+        &[
+            "extract",
+            a,
+            r"pc-w\lara.drm",
+            "-o",
+            o,
+            "--variant",
+            &variant,
+        ],
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(variant, "2");
+    assert_eq!(fs::read(&out).unwrap(), masked_bytes);
+}
+
+#[test]
 fn extract_json_names_hash_target_from_filelist() {
     let (dir, archive_path) = create_synthetic_archive("extract_json_hash");
     let a = archive_path.to_str().unwrap();

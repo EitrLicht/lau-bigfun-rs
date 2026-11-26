@@ -29,8 +29,9 @@ pub enum VariantLayout {
     /// Always place every entry under `<out_dir>/spec_<spec_flags:08x>/<path>`.
     AlwaysSpecSubdir,
 
-    /// Keep flat directory structure and append `.spec_<spec_flags:08x>` before the file extension
-    /// when multiple variants exist for the same `name_hash`.
+    /// Keep entries at `<out_dir>/<path>`, with no `spec_` directory, and append
+    /// `.spec_<spec_flags:08x>` before the file extension when multiple variants of the same
+    /// `name_hash` are selected.
     FilenameSuffix,
 }
 
@@ -117,8 +118,10 @@ pub struct UnpackReport {
 ///
 /// Each worker thread streams entries through one reusable chunk buffer of at most 1 MiB into a
 /// hidden staging directory under `out_dir`, renaming each file into place once it is complete.
-/// Symbolic links already inside `out_dir` are followed, except that a link to a directory on
-/// another filesystem fails, because files are moved into place from under `out_dir`.
+/// A symbolic link to a directory already inside `out_dir` is followed, except that a link to a
+/// directory on another filesystem fails, because files are moved into place from under
+/// `out_dir`. A symbolic link to a file where an output file goes is replaced by that file, not
+/// written through, unless it leads to a part file of an archive being read, which is refused.
 ///
 /// # Errors
 ///
@@ -448,6 +451,23 @@ mod tests {
         assert!(matches!(err, BigfileError::OutputPath { path, .. } if path == expected));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unpack_replaces_a_symlink_where_an_output_file_goes() {
+        let tmp = TempDir::new("unpack_replaces_link");
+        let bf = open_unnamed_record_archive(&tmp);
+        let out = tmp.join("out");
+        let (target, link) = (tmp.join("target.bin"), out.join("__unknown/deadbeef.bin"));
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&target, b"old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        unpack_archive(&bf, &HashDictionary::new(), &out, &UnpackOptions::default()).unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+    }
+
     #[test]
     fn unpack_archive_honors_single_match_per_hash() {
         let tmp = TempDir::new("engine_spec");
@@ -730,6 +750,24 @@ mod tests {
         let before = fs::read(&part).unwrap();
 
         let err = extract_entry(&bf, &bf.entries()[0], false, &link).unwrap_err();
+
+        assert!(refuses_archive_part(&err, &link), "{err:?}");
+        assert_eq!(fs::read(&part).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_refuses_a_symlink_to_an_archive_part() {
+        let tmp = TempDir::new("unpack_link_to_part");
+        let bf = open_unnamed_record_archive(&tmp);
+        let out = tmp.join("out");
+        let (part, link) = (tmp.join("bigfile.000"), out.join("__unknown/deadbeef.bin"));
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&part, &link).unwrap();
+        let before = fs::read(&part).unwrap();
+
+        let options = UnpackOptions::default();
+        let err = unpack_archive(&bf, &HashDictionary::new(), &out, &options).unwrap_err();
 
         assert!(refuses_archive_part(&err, &link), "{err:?}");
         assert_eq!(fs::read(&part).unwrap(), before);

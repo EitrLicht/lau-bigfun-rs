@@ -10,11 +10,23 @@ use crate::path::{fold_path_char, to_forward_slashes};
 
 /// Error returned when compiling a glob [`EntryFilter`].
 #[derive(Debug, Error)]
-#[error("invalid glob pattern '{pattern}': {}", source.kind())]
+#[error("{}", Self::describe(.pattern.as_deref()))]
 pub struct FilterError {
-    pattern: String,
+    /// The pattern that is not a valid glob, or `None` when every pattern is valid but they could
+    /// not be compiled together.
+    pattern: Option<String>,
     #[source]
     source: globset::Error,
+}
+
+impl FilterError {
+    /// The message for a failure at `pattern`, or at compiling every pattern together.
+    fn describe(pattern: Option<&str>) -> String {
+        match pattern {
+            Some(pattern) => format!("invalid glob pattern '{pattern}'"),
+            None => "the glob patterns could not be compiled together".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +54,8 @@ impl EntryFilter {
         ))
     }
 
-    /// Compiles one or more glob patterns into a case-insensitive [`EntryFilter`].
+    /// Compiles glob patterns into a case-insensitive [`EntryFilter`] that matches an entry when any
+    /// of them does, so no patterns give a filter that matches nothing.
     ///
     /// Leading `/` and `\` characters are stripped and `\` is normalized to `/`. Single `*`
     /// matches within a single path component (`literal_separator(true)`), while `**` matches
@@ -50,7 +63,8 @@ impl EntryFilter {
     ///
     /// # Errors
     ///
-    /// [`FilterError`] when a pattern is not a valid glob.
+    /// [`FilterError`] when a pattern is not a valid glob, or when the patterns are each valid but
+    /// too large to compile together.
     pub fn from_globs<I, S>(patterns: I) -> Result<Self, FilterError>
     where
         I: IntoIterator<Item = S>,
@@ -67,13 +81,13 @@ impl EntryFilter {
                 .literal_separator(true)
                 .build()
                 .map_err(|source| FilterError {
-                    pattern: raw.to_string(),
+                    pattern: Some(raw.to_string()),
                     source,
                 })?;
             builder.add(glob);
         }
         let set = builder.build().map_err(|source| FilterError {
-            pattern: "<globset>".to_string(),
+            pattern: None,
             source,
         })?;
         Ok(Self(EntryFilterKind::Glob { set, needs_names }))
@@ -213,6 +227,7 @@ fn skip_glob_alternatives(chars: &mut std::str::Chars<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_source_not_in_message;
 
     #[test]
     fn entry_filter_substring_normalizes_separators() {
@@ -265,9 +280,35 @@ mod tests {
     #[test]
     fn entry_filter_glob_rejects_invalid_pattern() {
         let err = EntryFilter::from_globs([r"\tr7\[unclosed"]).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.starts_with(r"invalid glob pattern '\tr7\[unclosed': "));
-        assert!(!msg.contains("error parsing glob"));
+        assert_eq!(err.to_string(), r"invalid glob pattern '\tr7\[unclosed'");
+    }
+
+    #[test]
+    fn no_glob_patterns_match_nothing() {
+        let filter = EntryFilter::from_globs(Vec::<&str>::new()).unwrap();
+
+        assert!(!filter.matches(0x5FF9_1900, Some(r"pc-w\lara.drm")));
+    }
+
+    #[test]
+    fn patterns_too_large_to_compile_together_name_no_pattern() {
+        let err = EntryFilter::from_globs(["?".repeat(200_000)]).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "the glob patterns could not be compiled together"
+        );
+    }
+
+    #[test]
+    fn glob_message_leaves_the_parse_error_to_source() {
+        let err = EntryFilter::from_globs([r"\tr7\[unclosed"]).unwrap_err();
+
+        let cause = assert_source_not_in_message::<globset::Error>(&err);
+
+        // globset's message holds the pattern and the reason, so check the reason on its own too.
+        let reason = cause.kind().to_string();
+        assert!(!err.to_string().contains(&reason), "{err}");
     }
 
     #[test]
